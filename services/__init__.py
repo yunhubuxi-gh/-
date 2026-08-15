@@ -86,13 +86,14 @@ def write_audit_log(
             logger.warning(f"写数据库审计日志失败: {e}")
 
 
-# 导出的 6 个业务服务单例（全部懒加载真实组件，import 不触发模型/网络加载）
+# 导出的 7 个业务服务单例（全部懒加载真实组件，import 不触发模型/网络加载）
 from services.auth_service import AuthService, auth_service
 from services.kb_service import KBService, kb_service
 from services.document_service import DocumentService, document_service
 from services.chat_service import ChatService, chat_service
 from services.agent_service import AgentService, agent_service
 from services.audit_service import AuditService, audit_service
+from services.exam_service import ExamService, exam_service
 
 __all__ = [
     "write_audit_log",
@@ -102,4 +103,5 @@ __all__ = [
     "ChatService", "chat_service",
     "AgentService", "agent_service",
     "AuditService", "audit_service",
+    "ExamService", "exam_service",
 ]

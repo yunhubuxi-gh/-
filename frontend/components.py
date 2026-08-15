@@ -51,6 +51,7 @@ def doc_status_badge(status: str) -> str:
         "ocr": ("OCR 识别中", "#3b5bdb", "#e9edfc"),
         "parsed": ("已解析", "#3b5bdb", "#e9edfc"),
         "embedding": ("文本向量化中", "#3b5bdb", "#e9edfc"),
+        "image_preprocess": ("图片预处理中", "#e8930c", "#fff4e0"),
         "image_embedding": ("图片向量化中", "#3b5bdb", "#e9edfc"),
         "ready": ("就绪", "#2f9e44", "#ebf7ee"),
         "failed": ("失败", "#e03131", "#fdeeee"),

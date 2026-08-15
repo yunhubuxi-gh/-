@@ -17,6 +17,7 @@ from api.router.document_router import router as document_router
 from api.router.chat_router import router as chat_router
 from api.router.agent_router import router as agent_router
 from api.router.audit_router import router as audit_router
+from api.router.exam_router import router as exam_router
 
 __all__ = [
     "auth_router",
@@ -25,4 +26,5 @@ __all__ = [
     "chat_router",
     "agent_router",
     "audit_router",
+    "exam_router",
 ]

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from typing import List, Tuple, Optional
 
-from ai.rag_engine.chunker.base_chunker import BaseChunker, Chunk
+from ai.rag_engine.chunker.base_chunker import BaseChunker, Chunk, normalize_chunk_text
 from ai.rag_engine.chunker.recursive_chunker import RecursiveChunker
 from ai.rag_engine.document_parser.base_parser import ParsedDocument
 from config.settings import settings
@@ -118,6 +118,10 @@ class SemanticChunker(BaseChunker):
         if buf:
             chunks.append(self._make_chunk(buf, document_id, len(chunks)))
 
+        # 归一化 + 合并过短块（避免语义被切碎成孤立小 chunk）
+        chunks = [self._normalize_chunk(c) for c in chunks]
+        chunks = self._merge_small_chunks(chunks)
+
         logger.debug(
             f"语义分块完成: document_id={document_id}, chunks={len(chunks)}, "
             f"threshold={self.threshold}"
@@ -168,3 +172,35 @@ class SemanticChunker(BaseChunker):
             start_char=0,
             end_char=len(text),
         )
+
+    @staticmethod
+    def _normalize_chunk(chunk: Chunk) -> Chunk:
+        chunk.text = normalize_chunk_text(chunk.text)
+        chunk.end_char = len(chunk.text)
+        return chunk
+
+    def _merge_small_chunks(self, chunks: List[Chunk]) -> List[Chunk]:
+        """
+        合并过短块到相邻块：把字符数低于 min_chunk_size 的块并入前一块，
+        且合并后不超过 chunk_size，避免破坏语义完整性的碎片块。
+        合并后重新编号 chunk_index / chunk_id。
+        """
+        if not chunks:
+            return chunks
+        min_size = settings.min_chunk_size
+        merged: List[Chunk] = []
+        for c in chunks:
+            if (
+                merged
+                and len(c.text) < min_size
+                and len(merged[-1].text) + 1 + len(c.text) <= self.chunk_size
+            ):
+                merged[-1].text = merged[-1].text + "\n" + c.text
+                merged[-1].end_char = len(merged[-1].text)
+            else:
+                merged.append(c)
+        # 重新编号，保证 chunk_id 连续且引用溯源正确
+        for i, c in enumerate(merged):
+            c.chunk_index = i
+            c.chunk_id = f"doc_{c.document_id}:{i}"
+        return merged

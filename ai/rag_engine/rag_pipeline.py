@@ -163,7 +163,7 @@ class RagPipeline:
         document_id: Any,
         document_name: str,
         images: Optional[List[Dict[str, Any]]] = None,
-    ) -> int:
+    ):
         """
         图片多模态向量化入库（加法式扩展，不影响文本 ingest_document）。
 
@@ -171,13 +171,13 @@ class RagPipeline:
             knowledge_base_id: 知识库 ID
             document_id: 文档 ID
             document_name: 文档名
-            images: [{image_path, page_number, index, ext}]，空则返回 0
+            images: [{image_path, page_number, index, ext}]，空则返回 (0, [])
 
         Returns:
-            写入的图片数量（开关关闭/模型不可用时返回 0）
+            (成功写入数, 警告列表)。单张失败只跳过该图并记录警告。
         """
         if not images:
-            return 0
+            return 0, []
         from ai.rag_engine.image_retriever import get_image_retriever
         return get_image_retriever().index_images(
             knowledge_base_id, document_id, document_name, images,
@@ -193,7 +193,12 @@ class RagPipeline:
         **kwargs,
     ) -> List[RetrievedChunk]:
         """
-        统一检索入口：多路混合召回 + 重排 + （可选）图片跨模态召回。
+        统一检索入口：缓存 → query 改写 → 多查询混合召回合并 → 图片跨模态召回。
+
+        说明：
+        - 原有「BM25 + 向量 → 融合 → 重排」混合检索逻辑完整保留（hybrid_retriever.retrieve），
+          本方法仅在之上叠加「缓存 / 改写 / 多查询合并」三层，单查询时行为与旧版一致。
+        - 图片召回仍为加法式追加，不受文本优化影响。
 
         Args:
             query: 用户查询
@@ -201,27 +206,108 @@ class RagPipeline:
             top_k: 返回条数
 
         Returns:
-            RetrievedChunk 列表（含 chunk 文本 + 文档名/页码/块号等引用元数据；
-            图片片段携带 chunk_type=image / image_path）
+            RetrievedChunk 列表（文本 + 图片，按相关性降序）
         """
-        chunks = self.retriever.retrieve(
-            query=query,
-            knowledge_base_ids=knowledge_base_ids,
-            top_k=top_k,
-            **kwargs,
-        )
+        kb_ids = list(knowledge_base_ids) if knowledge_base_ids else []
 
-        # 加法式图片召回：原有文本混合检索结果完全不动，仅在末尾追加图片结果
+        # 1. 缓存命中（跳过改写/召回/重排）
+        cache = self._get_cache()
+        if cache is not None:
+            cache_key = self._cache_key(query, kb_ids, top_k)
+            cached = cache.get(cache_key)
+            if cached is not None:
+                if settings.rag_debug_log:
+                    logger.info(f"[RAG调试] 缓存命中: query={query}")
+                return cached
+
+        # 2. query 改写（失败/关闭时退回原问题）
+        queries = self._rewrite_queries(query)
+
+        # 3. 多查询文本召回 + 合并（原有混合检索逻辑不变）
+        merged_text = self._retrieve_text_multi(queries, kb_ids, top_k, **kwargs)
+
+        # 4. 图片跨模态召回（加法式，用原始 query）
+        image_chunks = self._retrieve_images(query, kb_ids, top_k)
+
+        result = merged_text + image_chunks
+
+        # 5. 写缓存
+        if cache is not None:
+            cache.set(cache_key, result)
+
+        return result
+
+    # ---------- 召回优化辅助 ----------
+
+    def _get_cache(self):
+        from ai.rag_engine.retrieval_cache import get_retrieval_cache
+        return get_retrieval_cache()
+
+    def _rewrite_queries(self, query: str) -> List[str]:
+        """query 改写：返回 [原问题, 衍生1, ...]；关闭/失败时仅返回原问题"""
+        if not settings.query_rewrite_enabled:
+            return [query]
+        try:
+            from ai.rag_engine.query_rewriter import QueryRewriter
+            rewriter = QueryRewriter(llm_client=self._get_llm())
+            queries = rewriter.rewrite(query)
+        except Exception as e:
+            logger.warning(f"query 改写异常，退回原问题: {e}")
+            return [query]
+        if settings.rag_debug_log and len(queries) > 1:
+            logger.info(f"[RAG调试] query 改写: {query} -> {queries[1:]}")
+        return queries
+
+    def _retrieve_text_multi(
+        self,
+        queries: List[str],
+        kb_ids: List[Any],
+        top_k: int,
+        **kwargs,
+    ) -> List[RetrievedChunk]:
+        """对每个 query 做混合召回，去重合并后取 top_k"""
+        lists = [
+            self.retriever.retrieve(
+                query=q,
+                knowledge_base_ids=kb_ids or None,
+                top_k=top_k,
+                **kwargs,
+            )
+            for q in queries
+        ]
+        return self._merge_chunks(lists, top_k)
+
+    @staticmethod
+    def _merge_chunks(chunk_lists: List[List[RetrievedChunk]], top_k: int) -> List[RetrievedChunk]:
+        """按 chunk_id 去重合并多个查询的召回结果，保留最高分，按分数降序取 top_k"""
+        by_id: Dict[str, RetrievedChunk] = {}
+        for cl in chunk_lists:
+            for c in cl:
+                if c.chunk_id not in by_id or c.score > by_id[c.chunk_id].score:
+                    by_id[c.chunk_id] = c
+        merged = sorted(by_id.values(), key=lambda c: c.score, reverse=True)
+        return merged[:top_k]
+
+    def _retrieve_images(self, query: str, kb_ids: List[Any], top_k: int) -> List[RetrievedChunk]:
+        """图片跨模态召回（加法式，失败降级为空）。
+
+        关键：ENABLE_IMAGE_EMBED=false 时直接返回空，不 import 图片检索器、不加载 CLIP，
+        完全不执行 CLIP 相关代码路径。
+        """
+        if not settings.enable_image_embed:
+            return []
         try:
             from ai.rag_engine.image_retriever import get_image_retriever
-            image_chunks = get_image_retriever().retrieve_images(
-                query, knowledge_base_ids=knowledge_base_ids, top_k=top_k,
+            return get_image_retriever().retrieve_images(
+                query, knowledge_base_ids=kb_ids or None, top_k=top_k,
             )
         except Exception as e:
             logger.warning(f"图片检索失败，仅返回文本结果: {e}")
-            image_chunks = []
+            return []
 
-        return chunks + image_chunks
+    @staticmethod
+    def _cache_key(query: str, kb_ids: List[Any], top_k: int):
+        return (query.strip(), tuple(str(k) for k in kb_ids), int(top_k))
 
     # ---------- 问答生成 ----------
 

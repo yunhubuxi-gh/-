@@ -24,6 +24,7 @@ from config.constants import (
     DocumentStatus, DocumentType,
     ConversationType, MessageRole,
     AgentTaskStatus, AuditAction, AuditResult,
+    ExamPaperStatus, ExamQuestionType, AnswerSheetStatus,
 )
 
 
@@ -111,6 +112,7 @@ class KBCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=128, description="知识库名称")
     description: Optional[str] = Field(None, max_length=512, description="描述")
     icon: Optional[str] = Field(None, max_length=512, description="图标")
+    tags: Optional[List[str]] = Field(None, description="课程标签（字符串数组）")
 
 
 class KBUpdate(BaseModel):
@@ -118,6 +120,7 @@ class KBUpdate(BaseModel):
     name: Optional[str] = Field(None, max_length=128)
     description: Optional[str] = Field(None, max_length=512)
     icon: Optional[str] = Field(None, max_length=512)
+    tags: Optional[List[str]] = Field(None, description="课程标签（字符串数组）")
     status: Optional[str] = None
 
 
@@ -126,6 +129,7 @@ class KBResponse(BaseResponse):
     name: str
     description: Optional[str]
     icon: Optional[str]
+    tags: Optional[List[str]] = None
     owner_id: int
     status: str
     doc_count: int
@@ -307,3 +311,84 @@ class AuditLogQuery(BaseModel):
     end_time: Optional[datetime] = None
     page: int = 1
     page_size: int = 20
+
+
+# ============================================================
+# 试卷 / 答卷相关（课程试卷智能命题校验批改系统）
+# ============================================================
+
+class ExamQuestionConfig(BaseModel):
+    """题型配置（各类题目数量）"""
+    choice: int = Field(default=5, ge=0, le=50, description="单选题数量")
+    fill: int = Field(default=3, ge=0, le=50, description="填空题数量")
+    short: int = Field(default=2, ge=0, le=20, description="简答题数量")
+
+    @field_validator("choice", "fill", "short")
+    @classmethod
+    def non_negative(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("题目数量不能为负")
+        return v
+
+
+class ExamPaperCreate(BaseModel):
+    """生成试卷请求"""
+    knowledge_base_id: int = Field(..., description="课程库ID")
+    title: Optional[str] = Field(None, max_length=256, description="试卷标题（缺省自动生成）")
+    difficulty: str = Field(default="medium", description="难度 easy/medium/hard")
+    question_config: ExamQuestionConfig = Field(
+        default_factory=ExamQuestionConfig, description="题型配置"
+    )
+
+    @field_validator("difficulty")
+    @classmethod
+    def check_difficulty(cls, v: str) -> str:
+        if v not in ("easy", "medium", "hard"):
+            raise ValueError("难度只能是 easy/medium/hard")
+        return v
+
+
+class ExamPaperUpdate(BaseModel):
+    """复用旧试卷修改"""
+    title: Optional[str] = Field(None, max_length=256)
+    difficulty: Optional[str] = Field(None, description="难度")
+    questions: Optional[List[Dict[str, Any]]] = Field(None, description="题目列表")
+    reference_answers: Optional[List[Dict[str, Any]]] = Field(None, description="参考答案")
+
+
+class ExamPaperResponse(BaseResponse):
+    """试卷响应（不含题目明细）"""
+    knowledge_base_id: int
+    creator_id: Optional[int]
+    title: str
+    question_config: Optional[Dict[str, Any]] = None
+    difficulty: str
+    iterate_count: int
+    total_score: int
+    status: str
+    error_message: Optional[str]
+
+
+class ExamPaperDetailResponse(ExamPaperResponse):
+    """试卷详情（含题目 + 参考答案 + 双Agent执行轨迹）"""
+    questions: Optional[List[Dict[str, Any]]] = None
+    reference_answers: Optional[List[Dict[str, Any]]] = None
+    trace: Optional[List[Dict[str, Any]]] = None
+
+
+class AnswerSheetSubmit(BaseModel):
+    """学生提交答卷"""
+    answers: List[Dict[str, Any]] = Field(..., description="学生作答 [{qid, answer}]")
+
+
+class AnswerSheetResponse(BaseResponse):
+    """答卷响应"""
+    exam_paper_id: int
+    student_id: Optional[int]
+    answers: Optional[List[Dict[str, Any]]] = None
+    objective_score: int
+    subjective_score: int
+    total_score: int
+    grading_details: Optional[List[Dict[str, Any]]] = None
+    status: str
+    submitted_at: Optional[datetime]

@@ -118,14 +118,17 @@ class DocumentCRUD:
         doc_id: int,
         status: str,
         error_message: Optional[str] = None,
+        warning: Optional[str] = None,
     ) -> Optional[Document]:
-        """更新文档处理状态"""
+        """更新文档处理状态（可附带警告信息，警告不影响整体状态）"""
         doc = self.get_by_id(db, doc_id)
         if not doc:
             return None
         doc.status = status
         if error_message is not None:
             doc.error_message = error_message
+        if warning is not None:
+            doc.processing_warning = warning
         db.commit()
         db.refresh(doc)
         logger.debug(f"文档状态更新: id={doc_id}, status={status}")

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from ai.rag_engine.chunker.base_chunker import BaseChunker, Chunk
+from ai.rag_engine.chunker.base_chunker import BaseChunker, Chunk, normalize_chunk_text
 from ai.rag_engine.document_parser.base_parser import ParsedDocument
 from config.settings import settings
 from utils.logger import get_logger
@@ -94,7 +94,7 @@ class RecursiveChunker(BaseChunker):
 
     @staticmethod
     def _make_chunk(buf: List[str], page_number: int, document_id: str, index: int) -> Chunk:
-        text = "\n".join(buf).strip()
+        text = normalize_chunk_text("\n".join(buf))
         return Chunk(
             chunk_id=f"doc_{document_id}:{index}",
             document_id=document_id,

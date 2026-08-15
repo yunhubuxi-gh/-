@@ -69,11 +69,16 @@ services:
       LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-bge}
       EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
-      # 多模态图片向量化（读 .env；关闭开关时完全退回原文本 RAG 行为）
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-8}
+      RERANKER_MODEL: ${RERANKER_MODEL:-BAAI/bge-reranker-base}
+      # 图片多模态向量化 Chinese-CLIP（读 .env；ENABLE_IMAGE_EMBED=false 时完全退回原文本 RAG 行为）
+      # 进程内本地推理（modelscope 下载 + transformers 加载），不引入 Ollama、不调用外部图片 Embedding API
       ENABLE_IMAGE_EMBED: ${ENABLE_IMAGE_EMBED:-false}
-      MULTIMODAL_EMBEDDING_MODEL: ${MULTIMODAL_EMBEDDING_MODEL:-OFA-Sys/chinese-clip-vit-base-patch16}
-      MULTIMODAL_EMBEDDING_DEVICE: ${MULTIMODAL_EMBEDDING_DEVICE:-cpu}
-      IMAGE_MAX_SIDE: ${IMAGE_MAX_SIDE:-1024}
+      CLIP_MODEL_NAME: ${CLIP_MODEL_NAME:-damo/multi-modal_clip-vit-large-patch14_336_zh}
+      CLIP_DEVICE: ${CLIP_DEVICE:-auto}
+      CLIP_MAX_IMAGE_SIDE: ${CLIP_MAX_IMAGE_SIDE:-336}
+      CLIP_MIN_IMAGE_SIDE: ${CLIP_MIN_IMAGE_SIDE:-32}
+      CLIP_DOWNLOAD_RETRY: ${CLIP_DOWNLOAD_RETRY:-3}
       IMAGE_VECTOR_TOP_K: ${IMAGE_VECTOR_TOP_K:-5}
       # 向量库（chroma 容器内本地 / milvus 外部服务）
       VECTOR_STORE_TYPE: ${VECTOR_STORE_TYPE:-chroma}

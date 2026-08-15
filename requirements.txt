@@ -74,6 +74,15 @@ requests==2.32.5
 # paddleocr==3.2.0
 # paddlepaddle==3.1.1
 
+# ---------- 图片多模态向量化 Chinese-CLIP（可选，体积大）----------
+# 说明：仅在 ENABLE_IMAGE_EMBED=true 时需要；关闭时完全不需要，可保持注释以减小镜像体积。
+#   torch / transformers / modelscope 均为懒加载依赖：代码在开关关闭时不导入它们，缺少不会报错。
+#   pillow（PIL）为图片预处理所需（图片预处理与 CLIP 独立，仅用 PIL，不依赖 torch）。
+# torch==2.3.1
+# transformers==4.44.2
+# modelscope==1.15.0
+# pillow==10.4.0
+
 # ---------- 异步任务 Celery（生产分布式，缺省用 BackgroundTasks 引擎）----------
 # celery==5.4.0
 # redis==8.0.1

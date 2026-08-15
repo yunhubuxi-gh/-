@@ -3,11 +3,28 @@
 """
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import List, Dict, Any
 
 from ai.rag_engine.document_parser.base_parser import ParsedDocument
+
+
+def normalize_chunk_text(text: str) -> str:
+    """
+    分块文本归一化：折叠多余空格/全角空格，折叠过多空行。
+    用于清理解析阶段残留的换行空格，提升 embedding 质量与检索一致性。
+    """
+    if not text:
+        return ""
+    # 折叠行内多余空格（含全角空格、制表符）
+    text = re.sub(r"[ \t　]+", " ", text)
+    # 折叠 3 个及以上连续空行为 2 个（保留段落结构，去除多余空行）
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # 去除每行首尾空格
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    return text.strip()
 
 
 @dataclass

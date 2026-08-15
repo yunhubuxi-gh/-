@@ -25,7 +25,8 @@ class Citation:
     chunk_id: str
     excerpt: str = ""          # 原文片段（截断）
     score: float = 0.0
-    chunk_type: str = "text"   # 片段类型：text / image
+    chunk_type: str = "text"   # 片段类型：text / image（兼容旧字段）
+    content_type: str = "text"  # 结果类型：text / image（新增字段，供前端按类型渲染）
     image_path: str = ""       # 图片片段时携带本地图片路径
 
     def to_dict(self) -> Dict[str, Any]:
@@ -61,6 +62,8 @@ def build_citations(chunks: List[RetrievedChunk], excerpt_length: int = 80) -> L
         if len(excerpt) > excerpt_length:
             excerpt = excerpt[:excerpt_length] + "…"
 
+        chunk_type = chunk.metadata.get("chunk_type", "text")
+        content_type = chunk.metadata.get("content_type", chunk_type)
         citations.append(Citation(
             index=len(citations) + 1,
             document_id=chunk.document_id,
@@ -70,7 +73,8 @@ def build_citations(chunks: List[RetrievedChunk], excerpt_length: int = 80) -> L
             chunk_id=chunk.chunk_id,
             excerpt=excerpt,
             score=chunk.score,
-            chunk_type=chunk.metadata.get("chunk_type", "text"),
+            chunk_type=chunk_type,
+            content_type=content_type,
             image_path=chunk.metadata.get("image_path", ""),
         ))
     return citations

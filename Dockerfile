@@ -5,7 +5,15 @@
 FROM python:3.10-slim
 
 # 系统依赖：psycopg2-binary 需要 libpq（已含在二进制包内），
-# 其他重型依赖（torch/paddle）默认不装，保持镜像精简
+# 其他重型依赖（torch/paddle/CLIP）默认不装，保持镜像精简。
+#
+# 图片多模态向量化（Chinese-CLIP）为【可选】功能：
+#   不需要图片功能时可保持 requirements.txt 中 torch/transformers/modelscope/pillow 注释，
+#   并保持 .env 的 ENABLE_IMAGE_EMBED=false，镜像不含 CLIP 相关依赖，体积更小。
+#   需要图片功能时：取消 requirements.txt 中对应行注释（或下方单独安装），并设 ENABLE_IMAGE_EMBED=true。
+#
+#   # 需要图片功能时，取消下面注释单独安装 CLIP 依赖（进程内本地推理，不引入 Ollama）：
+#   RUN pip install --no-cache-dir torch transformers modelscope pillow
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1

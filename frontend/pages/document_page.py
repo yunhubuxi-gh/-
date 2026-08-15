@@ -50,8 +50,15 @@ def _upload_block(kb_id: int) -> None:
                 status_bar = st.progress(0, text="正在向量化…")
                 deadline = time.time() + config.POLL_MAX_WAIT_SECONDS
                 status_map = {
-                    "uploaded": 0.08, "parsing": 0.25, "extracting_images": 0.4, "ocr": 0.5,
-                    "parsed": 0.55, "embedding": 0.7, "image_embedding": 0.9, "ready": 1.0, "failed": 1.0,
+                    "uploaded": 0.05, "parsing": 0.15, "extracting_images": 0.3, "ocr": 0.4,
+                    "parsed": 0.45, "embedding": 0.6, "image_preprocess": 0.8,
+                    "image_embedding": 0.9, "ready": 1.0, "failed": 1.0,
+                }
+                status_label = {
+                    "uploaded": "待解析", "parsing": "解析文件", "extracting_images": "提取页面图片",
+                    "ocr": "OCR文字识别", "parsed": "已解析", "embedding": "文本分块&文本向量化",
+                    "image_preprocess": "图片预处理", "image_embedding": "图片多模态Embedding向量化",
+                    "ready": "写入向量库完成", "failed": "处理失败",
                 }
                 while time.time() < deadline:
                     try:
@@ -60,11 +67,19 @@ def _upload_block(kb_id: int) -> None:
                         time.sleep(config.POLL_INTERVAL_SECONDS)
                         continue
                     s = doc.get("status")
-                    status_bar.progress(min(status_map.get(s, 0.1), 0.9), text=f"状态：{s}")
+                    status_bar.progress(
+                        min(status_map.get(s, 0.1), 0.95),
+                        text=f"状态：{status_label.get(s, s)}",
+                    )
                     if s in ("ready", "failed"):
                         if s == "ready":
-                            status_bar.progress(1.0, text="向量化完成 ✅")
-                            notify_success("文档已就绪，可检索")
+                            status_bar.progress(1.0, text="写入向量库完成 ✅")
+                            warn = doc.get("processing_warning")
+                            if warn:
+                                notify_success("文档已就绪（部分图片向量化失败，见下方警告）")
+                                st.warning(warn)
+                            else:
+                                notify_success("文档已就绪，可检索")
                         else:
                             status_bar.empty()
                             notify_error(f"向量化失败：{doc.get('error_message') or '未知错误'}")

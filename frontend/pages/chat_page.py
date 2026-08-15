@@ -40,9 +40,10 @@ def _render_messages(msgs: list) -> None:
 
 
 def _render_citation_images(citations) -> None:
-    """渲染检索结果中的图片片段（chunk_type==image，通过后端接口取图）"""
+    """渲染检索结果中的图片片段（content_type==image，通过后端接口取图）"""
     for c in citations or []:
-        if c.get("chunk_type") != "image":
+        ctype = c.get("content_type") or c.get("chunk_type")
+        if ctype != "image":
             continue
         doc_id = c.get("document_id")
         page = c.get("page_number") or 1

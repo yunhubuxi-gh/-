@@ -36,6 +36,7 @@ from config.constants import (
     ConversationType, MessageRole,
     AgentTaskStatus, ToolCategory,
     AuditAction, AuditResult,
+    ExamPaperStatus, ExamQuestionType, AnswerSheetStatus,
 )
 
 
@@ -135,6 +136,11 @@ class KnowledgeBase(BaseModel):
     name = Column(String(128), nullable=False, comment="知识库名称")
     description = Column(String(512), nullable=True, comment="知识库描述")
     icon = Column(String(512), nullable=True, comment="图标")
+    tags = Column(
+        JSON,
+        nullable=True,
+        comment="课程标签（课程库语义，字符串数组，如 [\"数据结构\",\"算法\"]）",
+    )
 
     owner_id = Column(
         Integer,
@@ -282,6 +288,11 @@ class Document(BaseModel):
         comment="处理状态: uploaded/parsing/parsed/embedding/ready/failed",
     )
     error_message = Column(Text, nullable=True, comment="处理失败的错误信息")
+    processing_warning = Column(
+        Text,
+        nullable=True,
+        comment="处理过程中的警告信息（如部分图片向量化失败，文本已正常入库；不影响整体就绪）",
+    )
 
     # 解析统计
     page_count = Column(Integer, default=0, comment="页数（PDF）")
@@ -608,3 +619,137 @@ class AuditLog(BaseModel):
 
     # 关系
     user = relationship("User", back_populates="audit_logs")
+
+
+# ============================================================
+# 10. 试卷表（课程试卷智能命题校验批改系统）
+# ============================================================
+
+class ExamPaper(BaseModel):
+    """
+    试卷表
+
+    归属某个课程库（knowledge_bases），记录题型配置、题目集合、参考答案、
+    双 Agent 完整执行轨迹（命题 → 逐题校验 → 重生成）。
+    试卷题目/答案/轨迹均为结构化 JSON，不存文件。
+    """
+    __tablename__ = "exam_papers"
+    __table_args__ = (
+        Index("idx_exam_kb_id", "knowledge_base_id"),
+        Index("idx_exam_creator_id", "creator_id"),
+        Index("idx_exam_status", "status"),
+        {"comment": "试卷表"},
+    )
+
+    knowledge_base_id = Column(
+        Integer,
+        ForeignKey("knowledge_bases.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="归属课程库ID",
+    )
+    creator_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="创建者（教师）用户ID",
+    )
+
+    title = Column(String(256), nullable=False, comment="试卷标题")
+    question_config = Column(
+        JSON,
+        nullable=True,
+        comment="题型配置 {choice: 单选题数, fill: 填空题数, short: 简答题数}",
+    )
+    difficulty = Column(
+        String(32),
+        nullable=False,
+        default="medium",
+        comment="难度: easy/medium/hard",
+    )
+
+    # 题目列表（每题含答案、知识点、来源引用，见 ExamQuestionType）
+    questions = Column(
+        JSON,
+        nullable=True,
+        comment="题目列表 [{qid, type, stem, options, answer, knowledge_point, source_refs}]",
+    )
+    reference_answers = Column(
+        JSON,
+        nullable=True,
+        comment="参考答案（与题目一一对应，便于单独导出）",
+    )
+
+    # 双 Agent 执行轨迹（逐轮记录：检索 → 出题 → 逐题校验 → 重生成）
+    trace = Column(
+        JSON,
+        nullable=True,
+        comment="双Agent完整执行轨迹 [{iteration, phase, detail}]",
+    )
+
+    iterate_count = Column(Integer, default=0, comment="实际迭代次数")
+    total_score = Column(Integer, default=0, comment="试卷总分")
+    status = Column(
+        String(32),
+        nullable=False,
+        default=ExamPaperStatus.GENERATING.value,
+        comment="状态: generating/ready/failed",
+    )
+    error_message = Column(Text, nullable=True, comment="生成失败原因")
+
+
+# ============================================================
+# 11. 答卷表（课程试卷智能命题校验批改系统）
+# ============================================================
+
+class AnswerSheet(BaseModel):
+    """
+    答卷表
+
+    学生（read 权限）在线作答提交；客观题规则判分，主观题基于课程库课件溯源批改。
+    批改详情 grading_details 每道主观题带课件原文片段来源引用。
+    """
+    __tablename__ = "answer_sheets"
+    __table_args__ = (
+        Index("idx_answer_exam_id", "exam_paper_id"),
+        Index("idx_answer_student_id", "student_id"),
+        Index("idx_answer_status", "status"),
+        {"comment": "答卷表"},
+    )
+
+    exam_paper_id = Column(
+        Integer,
+        ForeignKey("exam_papers.id", ondelete="CASCADE"),
+        nullable=False,
+        comment="试卷ID",
+    )
+    student_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="学生用户ID",
+    )
+
+    answers = Column(
+        JSON,
+        nullable=True,
+        comment="学生作答 [{qid, answer}]",
+    )
+
+    objective_score = Column(Integer, default=0, comment="客观题得分")
+    subjective_score = Column(Integer, default=0, comment="主观题得分")
+    total_score = Column(Integer, default=0, comment="总分")
+
+    grading_details = Column(
+        JSON,
+        nullable=True,
+        comment="批改详情 [{qid, score, strengths, missing, source_refs}]，source_refs 为课件原文片段引用",
+    )
+
+    status = Column(
+        String(32),
+        nullable=False,
+        default=AnswerSheetStatus.SUBMITTED.value,
+        comment="状态: submitted/grading/graded",
+    )
+    error_message = Column(Text, nullable=True, comment="批改失败原因")
+    submitted_at = Column(DateTime, nullable=True, comment="提交时间")

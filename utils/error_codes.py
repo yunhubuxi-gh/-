@@ -71,6 +71,13 @@ AGENT_TASK_NOT_FOUND = ErrorCode(1500004, "Agent 任务不存在", 404)
 PERMISSION_DENIED = ErrorCode(1600001, "权限不足", 403)
 PERMISSION_INVALID_ROLE = ErrorCode(1600002, "无效的角色", 400)
 
+# ========== 试卷/答卷错误 17xxxxx ==========
+EXAM_PAPER_NOT_FOUND = ErrorCode(1700001, "试卷不存在", 404)
+EXAM_GENERATE_FAILED = ErrorCode(1700002, "试卷生成失败", 500)
+EXAM_NO_QUESTION = ErrorCode(1700003, "未配置任何题型", 400)
+EXAM_ANSWER_NOT_FOUND = ErrorCode(1700004, "答卷不存在", 404)
+EXAM_GRADE_FAILED = ErrorCode(1700005, "答卷批改失败", 500)
+
 
 # 错误码映射表，便于快速查找
 ERROR_CODE_MAP: Dict[int, ErrorCode] = {

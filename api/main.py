@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from config.settings import settings
+from config import setup_logging
 from api.handlers import register_exception_handlers
 from api.middleware import request_log_middleware
 from api.router import (
@@ -26,10 +27,14 @@ from api.router import (
     chat_router,
     agent_router,
     audit_router,
+    exam_router,
 )
 
 
 def create_app() -> FastAPI:
+    # 初始化全局日志系统（控制台 + 文件），否则项目 INFO 日志（含 RAG 调试日志）不输出
+    setup_logging()
+
     app = FastAPI(
         title=settings.app_name,
         version=settings.app_version,
@@ -58,6 +63,7 @@ def create_app() -> FastAPI:
     app.include_router(chat_router, prefix="/api/v1/chat", tags=["会话问答"])
     app.include_router(agent_router, prefix="/api/v1/agent", tags=["Agent 任务"])
     app.include_router(audit_router, prefix="/api/v1/audit", tags=["审计日志"])
+    app.include_router(exam_router, prefix="/api/v1/exam", tags=["试卷"])
 
     return app
 

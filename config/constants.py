@@ -55,6 +55,7 @@ class DocumentStatus(str, Enum):
     OCR = "ocr"                 # OCR 识别图片文字
     PARSED = "parsed"           # 解析完成，待向量化
     EMBEDDING = "embedding"     # 文本分块 & 文本向量化
+    IMAGE_PREPROCESS = "image_preprocess"     # 图片预处理（过滤极小图/等比例缩放/落盘副本）
     IMAGE_EMBEDDING = "image_embedding"       # 图片多模态 Embedding 向量化
     READY = "ready"             # 就绪（可检索）
     FAILED = "failed"           # 处理失败
@@ -155,6 +156,13 @@ class AuditAction(str, Enum):
     AGENT_TASK_CREATE = "agent_task_create"
     AGENT_TASK_COMPLETE = "agent_task_complete"
 
+    # 试卷/答卷相关（课程试卷命题校验批改系统）
+    EXAM_GENERATE = "exam_generate"          # 生成试卷任务
+    EXAM_UPDATE = "exam_update"              # 修改/复用试卷
+    EXAM_DELETE = "exam_delete"              # 删除试卷
+    EXAM_SUBMIT = "exam_submit"              # 学生提交答卷
+    EXAM_GRADE = "exam_grade"                # 批改答卷
+
     # 管理相关
     USER_CREATE = "user_create"
     USER_UPDATE = "user_update"
@@ -189,6 +197,49 @@ class TaskType(str, Enum):
     DOC_FULL_PROCESS = "doc_full_process" # 文档完整处理（解析+向量化）
     KB_REINDEX = "kb_reindex"             # 知识库重建索引
     EXPORT_TASK = "export_task"           # 导出任务
+    EXAM_GENERATE = "exam_generate"       # 试卷生成（双 Agent）
+    EXAM_GRADE = "exam_grade"             # 答卷批改
+
+
+# ============================================================
+# 试卷 / 答卷相关（课程试卷智能命题校验批改系统）
+# ============================================================
+
+class ExamPaperStatus(str, Enum):
+    """试卷生成状态"""
+    GENERATING = "generating"   # 双 Agent 命题-校验生成中
+    READY = "ready"             # 生成完成，可发布/导出
+    FAILED = "failed"           # 生成失败
+
+
+class ExamQuestionType(str, Enum):
+    """题目类型"""
+    CHOICE = "choice"           # 单选题
+    FILL = "fill"               # 填空题
+    SHORT = "short"             # 主观简答题
+
+
+class ExamDifficulty(str, Enum):
+    """试卷难度"""
+    EASY = "easy"
+    MEDIUM = "medium"
+    HARD = "hard"
+
+
+class AnswerSheetStatus(str, Enum):
+    """答卷批改状态"""
+    SUBMITTED = "submitted"     # 已提交，待批改
+    GRADING = "grading"         # 批改中（主观题后台批改）
+    GRADED = "graded"           # 批改完成
+    FAILED = "failed"           # 批改失败（异常）
+
+
+# 题目类型默认每题分值（可配置，见 settings）
+DEFAULT_QUESTION_SCORE = {
+    ExamQuestionType.CHOICE.value: 5,    # 单选题 5 分
+    ExamQuestionType.FILL.value: 5,      # 填空题 5 分
+    ExamQuestionType.SHORT.value: 20,    # 简答题 20 分
+}
 
 
 # ============================================================

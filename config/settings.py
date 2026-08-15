@@ -10,7 +10,7 @@ from functools import lru_cache
 
 import logging
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -90,18 +90,50 @@ class Settings(BaseSettings):
     enable_image_embed: bool = Field(
         default=False, description="图片向量化总开关；关闭则完全退回原文本 RAG 行为"
     )
-    multimodal_embedding_model: str = Field(
-        default="OFA-Sys/chinese-clip-vit-base-patch16",
-        description="多模态（图文）嵌入模型名，本地加载，与文本 BGE 分离",
+    # 模型名：默认用 modelscope 开源的 chinese-clip-vit-large-patch14-336px
+    # （modelscope 模型 id：damo/multi-modal_clip-vit-large-patch14_336_zh）。
+    # 可通过 .env 的 CLIP_MODEL_NAME 更换为任意 modelscope id 或本地目录路径。
+    clip_model_name: str = Field(
+        default="damo/multi-modal_clip-vit-large-patch14_336_zh",
+        description="Chinese-CLIP 模型名（modelscope 模型 id 或本地目录），进程内本地推理",
     )
-    multimodal_embedding_device: str = Field(default="cpu", description="多模态模型设备 cpu/cuda")
+    clip_device: str = Field(
+        default="auto",
+        description="Chinese-CLIP 运行设备 auto/cuda/cpu；auto 优先 cuda，无 GPU 自动降级 cpu",
+    )
+    clip_max_image_side: int = Field(
+        default=336,
+        description="图片预处理最大边长（等比例缩放），超过则压缩，防止 CLIP 推理 OOM",
+    )
+    clip_min_image_side: int = Field(
+        default=32,
+        description="图片预处理最小边长，低于此值的极小无效图片直接过滤，不做向量化",
+    )
+    clip_download_retry: int = Field(
+        default=3, description="Chinese-CLIP 模型下载重试次数，全部失败则关闭图片向量化功能",
+    )
+
+    # ---- 兼容旧配置（保留，缺省回退到上面的 clip_* 新配置）----
+    multimodal_embedding_model: str = Field(
+        default="",
+        description="（兼容）旧多模态模型名，CLIP_MODEL_NAME 未配置时回退到此项",
+    )
+    multimodal_embedding_device: str = Field(default="", description="（兼容）旧设备配置")
     multimodal_embedding_timeout: float = Field(
         default=60.0, description="多模态嵌入调用超时（秒，云端接口用）"
     )
     image_max_side: int = Field(
-        default=1024, description="图片预处理压缩的最大边长（避免大图导致接口/显存报错）"
+        default=0, description="（兼容）旧图片最大边长，CLIP_MAX_IMAGE_SIDE 未配置时回退到此项"
     )
     image_vector_top_k: int = Field(default=5, description="图片向量召回条数")
+
+    @field_validator("multimodal_embedding_timeout", "image_max_side", mode="before")
+    @classmethod
+    def _empty_numeric_to_default(cls, v, info):
+        """兼容旧 .env 中留空的数值项（如 IMAGE_MAX_SIDE=），空字符串回退默认值，避免启动报错"""
+        if isinstance(v, str) and not v.strip():
+            return cls.model_fields[info.field_name].default
+        return v
 
     # ========== 向量数据库配置（二选一，通过 VECTOR_STORE_TYPE 切换）==========
     vector_store_type: Literal["chroma", "milvus"] = Field(
@@ -131,13 +163,62 @@ class Settings(BaseSettings):
         default=0.75,
         description="语义分块相似度阈值，低于此值则切分",
     )
+    min_chunk_size: int = Field(
+        default=50,
+        description="语义分块后过短的块（字符数低于此值）合并到相邻块，避免语义被切碎",
+    )
     vector_top_k: int = Field(default=20)
     hallucination_check_enabled: bool = Field(default=True)
+
+    # ========== RAG 召回优化（新增，全部可通过 .env 覆盖）==========
+    # 重排候选数：融合后送入 rerank 的候选条数，应显著大于 reranker_top_n，
+    # 否则靠后的相关 chunk 会因进不了重排而被丢弃，导致「文档存在却检索不到」。
+    rerank_candidate_k: int = Field(default=20, description="送入重排的候选条数")
+    # 检索结果缓存（TTL 内存缓存，重复提问直接命中，跳过检索/改写）
+    rag_cache_enabled: bool = Field(default=True, description="检索结果缓存开关")
+    rag_cache_ttl: int = Field(default=300, description="缓存过期时间（秒）")
+    rag_cache_max_size: int = Field(default=512, description="缓存最大条目数")
+    # RAG 调试日志（打印 query 改写、向量/BM25 召回、rerank 结果）
+    rag_debug_log: bool = Field(default=False, description="RAG 调试日志开关")
+    # query 改写（生成衍生查询提升召回）
+    query_rewrite_enabled: bool = Field(default=True, description="query 改写开关")
+    query_rewrite_count: int = Field(default=2, description="衍生查询个数（1~2）")
+    query_rewrite_timeout: float = Field(default=10.0, description="query 改写 LLM 超时（秒）")
+    query_rewrite_max_tokens: int = Field(
+        default=1024,
+        description="query 改写 LLM 最大输出 token。DeepSeek 为推理模型，过小会导致 "
+                    "reasoning 吃光 token 而 content 为空，故默认取较大值",
+    )
+    # 向量写入批大小（embedding 分片 + 向量库单批写入条数）
+    vector_batch_size: int = Field(default=256, description="向量批量写入条数")
 
     # ========== Agent 配置 ==========
     agent_max_retry: int = Field(default=3, description="Agent 反思重试最大次数")
     agent_short_term_memory_window: int = Field(default=10)
     agent_long_term_memory_enabled: bool = Field(default=True)
+
+    # ========== 试卷命题/校验（双 Agent）配置 ==========
+    exam_max_iterate: int = Field(
+        default=3,
+        description="双 Agent（命题→校验→重生成）最大迭代次数，防止死循环",
+    )
+    exam_llm_timeout: float = Field(
+        default=120.0, description="出题/校验 LLM 调用超时（秒）"
+    )
+    exam_llm_max_tokens: int = Field(
+        default=4096,
+        description="出题/校验 LLM 最大输出 token。DeepSeek 为推理模型，过小会导致 "
+                    "reasoning 吃光 token 而 content 为空，故默认取较大值",
+    )
+    exam_rag_top_k: int = Field(
+        default=6, description="出题/校验时 RAG 召回课件原文条数"
+    )
+    exam_temperature: float = Field(
+        default=0.0, description="出题/校验 LLM 温度（0=稳定，降低随机性）"
+    )
+    exam_default_difficulty: str = Field(
+        default="medium", description="试卷默认难度 easy/medium/hard"
+    )
 
     # ========== 异步任务配置 ==========
     async_task_engine: Literal["background", "celery"] = Field(

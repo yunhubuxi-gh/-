@@ -148,23 +148,29 @@ class DocumentService:
         }
 
     def _process_document(self, document_id: int, kb_id: int, file_path: str, file_name: str) -> int:
-        """后台任务：解析 → 提取图片 → OCR → 文本向量化 → 图片向量化 → 状态流转"""
+        """后台任务：解析(含OCR) → 提取图片 → 文本向量化 → 图片预处理 → 图片向量化 → 状态流转。
+
+        容错铁则：某一张图片预处理/向量化异常只跳过该图、记录警告，绝不导致整体任务失败；
+        文档整体仍置为 READY，仅附带 processing_warning 警告信息。
+        """
         from db.session import SyncSessionLocal
         db = SyncSessionLocal()
+        warnings: List[str] = []
         try:
             # 0. 清理旧的图片向量（重建场景避免孤儿；首次上传为空操作）
             self._clear_image_vectors(kb_id, document_id)
 
-            # 1. 解析文件
+            # 1. 解析文件（PDF 内扫描页 / 图片文件的 OCR 文字识别在解析器内部完成）
             document_crud.update_status(db, document_id, DocumentStatus.PARSING.value)
             parsed = self._parse(file_path)
             document_crud.update_stats(
                 db, document_id, page_count=parsed.page_count, char_count=parsed.char_count,
             )
 
-            # 2. 提取图片（PDF 内嵌图）→ 落盘；图片文件则直接复用其自身
+            # 2. 提取页面图片（PDF 内嵌图）→ 落盘原图；图片文件则复用其自身。
+            #    仅开关开启时收集（轻量，不在此加载 CLIP）；图片向量化在确有图片时才懒加载 CLIP。
             image_items: List[Dict[str, Any]] = []
-            if self._image_embed_enabled():
+            if settings.enable_image_embed:
                 document_crud.update_status(db, document_id, DocumentStatus.EXTRACTING_IMAGES.value)
                 image_items = self._collect_images(document_id, kb_id, file_path, parsed)
 
@@ -175,18 +181,37 @@ class DocumentService:
                 kb_id, document_id, file_name, parsed=parsed,
             )
 
-            # 4. 图片多模态 Embedding 向量化（写入独立集合）
+            # 4. 图片预处理（过滤极小图 / 等比例缩放 / 落盘副本），逐张 try-except。
+            #    这里才真正懒加载 CLIP：无图片的文档（md/txt 等）不会触碰多模态模型。
+            embed_items: List[Dict[str, Any]] = []
             image_count = 0
             if image_items:
-                document_crud.update_status(db, document_id, DocumentStatus.IMAGE_EMBEDDING.value)
-                image_count = pipeline.ingest_images(kb_id, document_id, file_name, image_items)
+                if self._image_embed_enabled():
+                    document_crud.update_status(db, document_id, DocumentStatus.IMAGE_PREPROCESS.value)
+                    embed_items, pre_warnings = self._preprocess_images(document_id, kb_id, image_items)
+                    warnings.extend(pre_warnings)
 
-            # 5. 完成
+                    # 5. 图片多模态 Embedding 向量化（写入独立集合），逐张 try-except
+                    if embed_items:
+                        document_crud.update_status(db, document_id, DocumentStatus.IMAGE_EMBEDDING.value)
+                        image_count, embed_warnings = pipeline.ingest_images(
+                            kb_id, document_id, file_name, embed_items,
+                        )
+                        warnings.extend(embed_warnings)
+                else:
+                    # 开关开启但多模态模型加载失败：跳过图片向量，记录警告，文本照常入库
+                    warnings.append("图片向量化不可用（多模态模型加载失败），已跳过图片向量")
+
+            # 6. 完成（图片失败仅写警告，不置 FAILED）
+            warning_text = self._format_warning(warnings)
             document_crud.update_stats(db, document_id, chunk_count=chunk_count)
-            document_crud.update_status(db, document_id, DocumentStatus.READY.value)
+            document_crud.update_status(
+                db, document_id, DocumentStatus.READY.value, warning=warning_text,
+            )
             kb_crud.update_stats(db, kb_id, doc_delta=1, chunk_delta=chunk_count)
             logger.info(
-                f"文档处理完成: doc={document_id}, chunks={chunk_count}, images={image_count}"
+                f"文档处理完成: doc={document_id}, chunks={chunk_count}, images={image_count}, "
+                f"warnings={len(warnings)}"
             )
             return chunk_count
         except Exception as e:
@@ -287,6 +312,58 @@ class DocumentService:
         except Exception as e:
             logger.warning(f"图片落盘失败: {e}")
             return None
+
+    @staticmethod
+    def _preprocess_images(
+        document_id: int, kb_id: int, image_items: List[Dict[str, Any]],
+    ) -> tuple:
+        """
+        对收集到的原图逐张预处理（过滤极小图 + 等比例缩放 + 落盘副本）。
+
+        单张图片读取/预处理异常只跳过该图并记录警告，绝不抛异常中断整体流程。
+
+        Returns:
+            (embed_items, warnings)：embed_items 为预处理后副本的图片列表，供 CLIP 向量化。
+        """
+        from utils.file_utils import get_upload_path
+        from ai.rag_engine.image_preprocess import preprocess_image
+
+        embed_items: List[Dict[str, Any]] = []
+        warnings: List[str] = []
+        img_dir = get_upload_path(f"kb_{kb_id}") / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        for img in image_items:
+            src = img.get("image_path", "")
+            page = img.get("page_number", 1)
+            idx = img.get("index", 0)
+            try:
+                with open(src, "rb") as f:
+                    raw = f.read()
+            except Exception as e:
+                logger.warning(f"图片读取失败，跳过: p{page}_{idx}, err={e}")
+                warnings.append(f"图片第{page}页第{idx}张读取失败：{e}")
+                continue
+
+            out = str((img_dir / f"doc_{document_id}_p{page}_{idx}_processed.png").resolve())
+            ok, msg = preprocess_image(raw, out)
+            if not ok:
+                logger.warning(f"图片预处理失败，跳过: p{page}_{idx}, {msg}")
+                warnings.append(f"图片第{page}页第{idx}张预处理失败：{msg}")
+                continue
+            embed_items.append({**img, "image_path": out})
+
+        return embed_items, warnings
+
+    @staticmethod
+    def _format_warning(warnings: List[str]) -> Optional[str]:
+        """把图片处理警告拼成单条前端可展示的警告信息"""
+        if not warnings:
+            return None
+        detail = "；".join(warnings[:5])
+        if len(warnings) > 5:
+            detail += f"；…等共 {len(warnings)} 张"
+        return f"部分图片向量化失败（共 {len(warnings)} 张），文本内容已正常入库。详情：{detail}"
 
     @staticmethod
     def _parse(file_path: str):

@@ -10,6 +10,7 @@ from db.crud.document_crud import document_crud
 from db.crud.conversation_crud import conversation_crud, message_crud
 from db.crud.agent_task_crud import agent_task_crud
 from db.crud.audit_log_crud import audit_log_crud
+from db.crud.exam_crud import exam_paper_crud, answer_sheet_crud
 
 __all__ = [
     "user_crud",
@@ -19,4 +20,6 @@ __all__ = [
     "message_crud",
     "agent_task_crud",
     "audit_log_crud",
+    "exam_paper_crud",
+    "answer_sheet_crud",
 ]

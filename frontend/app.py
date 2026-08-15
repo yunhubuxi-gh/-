@@ -25,13 +25,14 @@ from frontend.auth import is_authenticated, get_user, logout  # noqa: E402
 from frontend.api_client import api, ApiError  # noqa: E402
 from frontend.components import notify_success, notify_error  # noqa: E402
 from frontend.pages import (  # noqa: E402
-    auth_page, kb_page, document_page, chat_page, agent_page, audit_page,
+    auth_page, kb_page, document_page, chat_page, agent_page, audit_page, exam_page,
 )
 
-# 页面注册表（知识库管理居首，登录后默认落地页）
+# 页面注册表（课程库管理居首，登录后默认落地页）
 PAGES = {
-    "kb": ("📚 知识库管理", kb_page),
-    "document": ("📄 文档管理", document_page),
+    "kb": ("📚 课程库", kb_page),
+    "document": ("📄 课件管理", document_page),
+    "exam": ("📝 试卷中心", exam_page),
     "chat": ("💬 智能问答", chat_page),
     "agent": ("🤖 Agent 任务", agent_page),
     "audit": ("📊 审计日志", audit_page),
@@ -44,8 +45,8 @@ def _esc(s) -> str:
 
 def _page_config() -> None:
     st.set_page_config(
-        page_title="企业私有知识库智能助手",
-        page_icon="🏢",
+        page_title="课程试卷智能命题校验批改系统",
+        page_icon="🎓",
         layout="wide",
         initial_sidebar_state="expanded",
     )
@@ -61,9 +62,9 @@ def _render_sidebar() -> str:
     with st.sidebar:
         st.markdown(
             '<div class="sidebar-brand">'
-            '<div class="sidebar-logo">企</div>'
-            '<div><div class="sidebar-title">私有知识库助手</div>'
-            '<div class="sidebar-sub">Enterprise KB Assistant</div></div>'
+            '<div class="sidebar-logo">课</div>'
+            '<div><div class="sidebar-title">智能命题批改系统</div>'
+            '<div class="sidebar-sub">Exam Generation & Grading</div></div>'
             '</div>',
             unsafe_allow_html=True,
         )

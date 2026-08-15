@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import List
 
 from ai.rag_engine.chunker.base_chunker import Chunk
+from config.settings import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -67,8 +68,10 @@ class DocVersionManager:
         embedding_client = self._get_embedding()
 
         texts = [c.text for c in chunks]
-        embeddings = embedding_client.embed(texts)
+        # embedding 按批调用（避免一次性把全文塞进单个请求/单次前向，控制内存与请求大小）
+        embeddings = self._embed_batched(embedding_client, texts)
 
+        # 向量库单批写入（一批完成再落盘；Chroma/Milvus 内部按单次 upsert 持久化）
         store.upsert(
             collection_name=collection_name,
             ids=[c.chunk_id for c in chunks],
@@ -77,8 +80,23 @@ class DocVersionManager:
             metadatas=[c.to_vector_metadata(knowledge_base_id) for c in chunks],
         )
         bm25.add_documents(collection_name, chunks)
+        # 持久化 BM25 索引到磁盘，重启后端后可恢复，避免 BM25 召回失效
+        try:
+            bm25.save(collection_name)
+        except Exception as e:
+            logger.warning(f"BM25 索引持久化失败（不影响本次入库）: {e}")
         logger.info(f"写入索引: collection={collection_name}, chunks={len(chunks)}")
         return len(chunks)
+
+    @staticmethod
+    def _embed_batched(embedding_client, texts: List[str]) -> List[List[float]]:
+        """按 settings.embedding_batch_size 分批生成嵌入，再拼接（顺序与输入一致）"""
+        batch_size = max(1, int(settings.embedding_batch_size))
+        vectors: List[List[float]] = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i:i + batch_size]
+            vectors.extend(embedding_client.embed(batch))
+        return vectors
 
     def clear_document_chunks(
         self,

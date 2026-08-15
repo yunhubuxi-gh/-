@@ -222,6 +222,24 @@ class BM25Engine:
             logger.warning(f"加载 BM25 索引失败: {collection_name}, {e}")
             return False
 
+    def load_all(self) -> int:
+        """扫描索引目录，加载所有已持久化的集合索引（启动时调用，恢复重启前索引）"""
+        if not os.path.isdir(self._index_dir):
+            return 0
+        loaded = 0
+        try:
+            for fn in os.listdir(self._index_dir):
+                if not fn.endswith(".pkl"):
+                    continue
+                name = fn[:-4]  # 去掉 .pkl 后缀即集合名（kb_{id} 经 _index_path 过滤后不变）
+                if name not in self._indexes and self.load(name):
+                    loaded += 1
+        except OSError as e:
+            logger.warning(f"扫描 BM25 索引目录失败: {e}")
+        if loaded:
+            logger.info(f"BM25 索引已从磁盘恢复 {loaded} 个集合")
+        return loaded
+
     def _index_path(self, collection_name: str) -> str:
         safe = "".join(c for c in collection_name if c.isalnum() or c in "-_")
         return os.path.join(self._index_dir, f"{safe}.pkl")
@@ -232,10 +250,11 @@ _bm25_engine: Optional[BM25Engine] = None
 
 
 def get_bm25_engine() -> BM25Engine:
-    """获取 BM25 引擎单例"""
+    """获取 BM25 引擎单例（首次创建时自动从磁盘恢复已有索引）"""
     global _bm25_engine
     if _bm25_engine is None:
         _bm25_engine = BM25Engine()
+        _bm25_engine.load_all()
     return _bm25_engine
 
 

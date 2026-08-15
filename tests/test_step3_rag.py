@@ -194,7 +194,27 @@ def _make_pipeline():
     ), store, embedder
 
 
+def _clean_bm25():
+    """重置 BM25 单例并清空磁盘索引，避免跨测试残留导致 count 断言失败。
+
+    load_all() 会在首次 get_bm25_engine() 时恢复磁盘上的旧 .pkl 索引，
+    若前一次运行残留 kb_1.pkl，则 add_documents 后 count 会包含旧块。
+    """
+    from ai.rag_engine.bm25_retriever import reset_bm25_engine
+    reset_bm25_engine()
+    from config.settings import settings
+    index_dir = settings.bm25_index_dir
+    if os.path.isdir(index_dir):
+        for fn in os.listdir(index_dir):
+            if fn.endswith(".pkl"):
+                try:
+                    os.remove(os.path.join(index_dir, fn))
+                except OSError:
+                    pass
+
+
 def _ingest_sample(pipeline, kb_id=1, doc_id=1):
+    _clean_bm25()
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as f:
         f.write(SAMPLE_DOC)
         path = f.name

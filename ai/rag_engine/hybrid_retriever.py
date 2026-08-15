@@ -104,6 +104,7 @@ class HybridRetriever:
         vector_top_k: Optional[int] = None,
         bm25_top_k: Optional[int] = None,
         rerank_top_n: Optional[int] = None,
+        rerank_candidate_k: Optional[int] = None,
     ) -> List[RetrievedChunk]:
         """
         多路混合召回。
@@ -114,7 +115,8 @@ class HybridRetriever:
             top_k: 最终返回条数
             vector_top_k: 向量召回候选数（默认取 config.vector_top_k）
             bm25_top_k: BM25 召回候选数（默认取 config.bm25_top_k）
-            rerank_top_n: 重排候选数（默认取 config.reranker_top_n）
+            rerank_top_n: 重排最终返回条数（默认取 config.reranker_top_n）
+            rerank_candidate_k: 送入重排的候选条数（默认取 config.rerank_candidate_k，应 > rerank_top_n）
 
         Returns:
             RetrievedChunk 列表，按相关性降序
@@ -122,6 +124,7 @@ class HybridRetriever:
         vector_top_k = vector_top_k or settings.vector_top_k
         bm25_top_k = bm25_top_k or settings.bm25_top_k
         rerank_top_n = rerank_top_n or settings.reranker_top_n
+        rerank_candidate_k = rerank_candidate_k or settings.rerank_candidate_k
 
         collection_names = self._resolve_collections(knowledge_base_ids)
         if not collection_names:
@@ -154,12 +157,16 @@ class HybridRetriever:
         # 融合 + 去重
         fused = self._fuse(vector_hits, bm25_hits)
 
+        if settings.rag_debug_log:
+            self._debug_log(query, vector_hits, bm25_hits, fused)
+
         if not fused:
             return []
 
-        # 精排
+        # 精排：候选数用 rerank_candidate_k（显著大于 rerank_top_n），
+        # 保证融合排序靠后但语义相关的 chunk 也有机会进入重排，避免漏召回
         fused.sort(key=lambda c: c.score, reverse=True)
-        rerank_candidates = fused[:rerank_top_n]
+        rerank_candidates = fused[:rerank_candidate_k]
         try:
             reranker = self._get_reranker()
             contents = [c.content for c in rerank_candidates]
@@ -172,11 +179,38 @@ class HybridRetriever:
             logger.warning(f"重排失败，使用融合分数排序: {e}")
             result = fused[:top_k]
 
+        if settings.rag_debug_log:
+            logger.info(
+                f"[RAG调试] 重排后结果: {[(c.chunk_id, round(c.score, 4)) for c in result]}"
+            )
+
         logger.info(
             f"混合召回完成: query={query[:30]}, collections={collection_names}, "
             f"vector={len(vector_hits)}, bm25={len(bm25_hits)}, final={len(result)}"
         )
         return result
+
+    @staticmethod
+    def _debug_log(
+        query: str,
+        vector_hits: Dict[str, "RetrievedChunk"],
+        bm25_hits: Dict[str, "RetrievedChunk"],
+        fused: List["RetrievedChunk"],
+    ) -> None:
+        """打印召回各环节命中情况，用于排查「文档存在却检索不到」"""
+        logger.info(f"[RAG调试] 原始query: {query}")
+        logger.info(
+            f"[RAG调试] 向量召回 {len(vector_hits)} 条: "
+            f"{[(c.chunk_id, round(c.score, 4)) for c in list(vector_hits.values())[:10]]}"
+        )
+        logger.info(
+            f"[RAG调试] BM25召回 {len(bm25_hits)} 条: "
+            f"{[(c.chunk_id, round(c.score, 4)) for c in list(bm25_hits.values())[:10]]}"
+        )
+        logger.info(
+            f"[RAG调试] 融合后 {len(fused)} 条: "
+            f"{[(c.chunk_id, round(c.score, 4)) for c in fused[:20]]}"
+        )
 
     # ---------- 融合算法 ----------
 
