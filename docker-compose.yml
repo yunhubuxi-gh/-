@@ -1,0 +1,123 @@
+# ============================================================
+# 企业私有知识库智能助手 — Docker Compose 一键编排
+#
+# 服务：
+#   postgres   PostgreSQL 数据库（业务元数据）
+#   backend    FastAPI 后端（启动时复用 db/init_db.py 建表 + 初始化管理员）
+#   frontend   Streamlit 前端（通过 FRONTEND_API_BASE_URL 指向 backend）
+#
+# 向量库：
+#   VECTOR_STORE_TYPE=chroma  → 后端容器内本地 Chroma，持久化到 vector_data 卷
+#   VECTOR_STORE_TYPE=milvus  → 连接外部 Milvus 服务（MILVUS_HOST/MILVUS_PORT）
+#
+# 数据卷（容器删除数据不丢失）：
+#   pg_data       PostgreSQL 数据
+#   upload_data   上传文档（文件系统）
+#   vector_data   向量库持久化
+#   log_data      日志
+#   bm25_data     BM25 索引
+#   memory_data   长期记忆
+#
+# 密钥全部读取 .env，禁止硬编码到本文件。
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: kb-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kbuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-kbpass123}
+      POSTGRES_DB: ${POSTGRES_DB:-kb_assistant}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"           # 便于宿主机调试；生产可移除对外暴露
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-kbuser} -d ${POSTGRES_DB:-kb_assistant}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: kb-backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # 应用
+      DEBUG: ${DEBUG:-false}
+      API_HOST: "0.0.0.0"
+      API_PORT: "8000"
+      # 数据库（指向 postgres 服务）
+      DATABASE_URL: ${DATABASE_URL:-postgresql://kbuser:kbpass123@postgres:5432/kb_assistant}
+      # JWT（读 .env）
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      # DeepSeek 统一配置（读 .env，禁止在 yml 写死密钥）
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      # 大模型 / 嵌入（读 .env）
+      LLM_PROVIDER: ${LLM_PROVIDER:-deepseek}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-v4-flash}
+      LLM_TIMEOUT: ${LLM_TIMEOUT:-60}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-bge}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
+      # 多模态图片向量化（读 .env；关闭开关时完全退回原文本 RAG 行为）
+      ENABLE_IMAGE_EMBED: ${ENABLE_IMAGE_EMBED:-false}
+      MULTIMODAL_EMBEDDING_MODEL: ${MULTIMODAL_EMBEDDING_MODEL:-OFA-Sys/chinese-clip-vit-base-patch16}
+      MULTIMODAL_EMBEDDING_DEVICE: ${MULTIMODAL_EMBEDDING_DEVICE:-cpu}
+      IMAGE_MAX_SIDE: ${IMAGE_MAX_SIDE:-1024}
+      IMAGE_VECTOR_TOP_K: ${IMAGE_VECTOR_TOP_K:-5}
+      # 向量库（chroma 容器内本地 / milvus 外部服务）
+      VECTOR_STORE_TYPE: ${VECTOR_STORE_TYPE:-chroma}
+      CHROMA_PERSIST_DIR: /app/data/vector_store
+      MILVUS_HOST: ${MILVUS_HOST:-milvus}
+      MILVUS_PORT: ${MILVUS_PORT:-19530}
+      # 文件 / 日志（容器内路径，对应挂载卷）
+      UPLOAD_DIR: /app/data/uploads
+      EXPORT_DIR: /app/data/exports
+      LOG_DIR: /app/data/logs
+      BM25_INDEX_DIR: /app/data/bm25_index
+      AGENT_LONG_TERM_DIR: /app/data/long_term_memory
+      # 跨域
+      CORS_ORIGINS: ${CORS_ORIGINS:-["http://localhost:8501","http://127.0.0.1:8501"]}
+    volumes:
+      - upload_data:/app/data/uploads
+      - vector_data:/app/data/vector_store
+      - log_data:/app/data/logs
+      - bm25_data:/app/data/bm25_index
+      - memory_data:/app/data/long_term_memory
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: kb-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      # 前端访问后端的地址（指向 backend 容器）
+      FRONTEND_API_BASE_URL: ${FRONTEND_API_BASE_URL:-http://backend:8000}
+      FRONTEND_TIMEOUT: ${FRONTEND_TIMEOUT:-60}
+      FRONTEND_POLL_INTERVAL: ${FRONTEND_POLL_INTERVAL:-1.0}
+      FRONTEND_POLL_MAX_WAIT: ${FRONTEND_POLL_MAX_WAIT:-180}
+    ports:
+      - "8501:8501"
+
+volumes:
+  pg_data:
+  upload_data:
+  vector_data:
+  log_data:
+  bm25_data:
+  memory_data:

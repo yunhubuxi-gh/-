@@ -1,0 +1,79 @@
+# ============================================================
+# 企业私有知识库智能助手 — Python 依赖清单
+# Python 版本要求：3.10+
+#
+# 说明：
+# 1. 全部依赖精确锁定版本（==），禁止 >= / ~ / 模糊版本，避免环境冲突。
+# 2. 已按「核心运行依赖」与「可选功能依赖」分区。
+#    默认 `pip install -r requirements.txt` 只安装核心依赖（可跑通全链路）。
+# 3. 【可选功能依赖】为懒加载组件，代码内部已做优雅降级：
+#    - pymilvus      未装时 vector_store_type=milvus 会提示切换 chroma
+#    - FlagEmbedding 未装时 rerank 自动降级为 OverlapReranker（词重叠兜底）
+#    - paddleocr     未装时扫描件 PDF 跳过 OCR
+#    - celery        未装时异步任务用 BackgroundTasks 引擎
+#    需要启用时，取消对应行注释后重新安装即可。
+# 4. 本清单不含测试专用冗余包（pytest / httpx 等，测试脚本为纯 assert 手写）。
+# ============================================================
+
+
+# ============================================================
+# 【核心运行依赖】必装
+# ============================================================
+
+# ---------- Web 框架 / API ----------
+fastapi==0.141.1
+starlette==1.3.1
+uvicorn==0.34.0
+pydantic==2.9.2
+pydantic-settings==2.5.2
+python-dotenv==1.0.1
+python-multipart==0.0.20
+
+# ---------- 数据库（ORM）----------
+SQLAlchemy==2.0.36
+numpy==1.26.4                      # chromadb / 向量计算对 numpy 版本敏感，显式锁 <2.0
+
+# ---------- 认证 / 安全 ----------
+bcrypt==4.0.1
+PyJWT==2.13.0
+
+# ---------- 大模型（OpenAI 兼容接口，可切 DeepSeek / Qwen / Ollama）----------
+openai==1.109.1
+
+# ---------- RAG 引擎 ----------
+chromadb==0.5.23                   # 向量库（Chroma，默认）
+sentence-transformers==3.3.1       # 嵌入模型（BGE）
+rank-bm25==0.2.2                   # BM25 关键词召回
+jieba==0.42.1                      # 中文分词
+PyMuPDF==1.24.10                   # PDF 文本层提取（import fitz）
+python-docx==1.1.2                 # Word 文档解析
+
+# ---------- Agent（LangGraph）----------
+langgraph==1.0.7
+langchain-core==0.3.29             # langgraph 运行依赖
+
+# ---------- 前端（Streamlit）----------
+streamlit==1.61.1
+requests==2.32.5
+
+
+# ============================================================
+# 【可选功能依赖】按需取消注释安装
+# ============================================================
+
+# ---------- PostgreSQL 驱动（生产环境；本地 sqlite 无需）----------
+# psycopg2-binary==2.9.9
+
+# ---------- 向量库 Milvus 客户端（切换 VECTOR_STORE_TYPE=milvus 时）----------
+# pymilvus==2.4.4
+
+# ---------- BGE-Rerank 精排模型（体积大，缺省用 OverlapReranker 兜底）----------
+# FlagEmbedding==1.3.3
+
+# ---------- OCR（扫描件 PDF 文字识别，体积大）----------
+# paddleocr==3.2.0
+# paddlepaddle==3.1.1
+
+# ---------- 异步任务 Celery（生产分布式，缺省用 BackgroundTasks 引擎）----------
+# celery==5.4.0
+# redis==8.0.1
