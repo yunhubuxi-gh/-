@@ -42,6 +42,10 @@ class BgeReranker(BaseReranker):
 
     def __init__(self, model_name: str | None = None, device: str | None = None,
                  use_fp16: bool = True):
+        import os
+        if settings.hf_hub_offline:
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            os.environ["TRANSFORMERS_OFFLINE"] = "1"
         try:
             from FlagEmbedding import FlagReranker
         except ImportError as e:

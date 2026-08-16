@@ -246,6 +246,93 @@ ENABLE_IMAGE_EMBED=true
 
 ---
 
+# 修改清单 — 环境依赖修复（PyMuPDF + HuggingFace 离线加载）
+
+> 日期：2026-08-16
+> 范围：修复两个导致「PDF/图片向量化失败」的环境依赖问题。均不影响业务代码结构，仅补齐依赖与 HF 离线加载时序。
+
+## 一、问题与根因
+
+| 现象 | 根因 | 修复 |
+|------|------|------|
+| PDF 上传报 `[1300005] PyMuPDF 未安装`，文档处理失败 | 环境缺少 `pymupdf`（`import fitz`），`requirements.txt` 虽声明但未实际安装 | 补装 `PyMuPDF==1.24.10` |
+| 文本向量化失败，日志 `huggingface.co ... SSL: CERTIFICATE_VERIFY_FAILED` | BGE 模型已本地缓存，但加载时仍联网去 huggingface.co 校验；且 `HF_HUB_OFFLINE` 之前在客户端 `__init__` 才设置，**晚于** huggingface_hub 导入（库在导入时就把该值读成常量） | 将 `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` 的设置提前到 `config/settings.py` **模块加载时** |
+
+## 二、变更清单
+
+| 文件 | 变更内容 | 类型 |
+|------|---------|------|
+| `config/settings.py` | 新增 `hf_hub_offline: bool = True` 配置；模块加载末尾（`settings = get_settings()` 之后）立即写 `os.environ.setdefault("HF_HUB_OFFLINE"/"TRANSFORMERS_OFFLINE", "1")`，早于任何 HF 库导入 | 修改 |
+| `utils/embedding_client.py` | 新增 `_apply_hf_offline()`，`BgeEmbeddingClient.__init__` 调用（保留兜底，双保险） | 修改 |
+| `ai/rag_engine/reranker/bge_reranker.py` | `BgeReranker.__init__` 在加载 FlagReranker 前写 `HF_HUB_OFFLINE`/`TRANSFORMERS_OFFLINE` | 修改 |
+| `.env` / `.env.example` | 新增 `HF_HUB_OFFLINE=true` 配置项 + 注释 | 修改 |
+| `README.md` | 「快速开始」加核心依赖自检；「关键配置」加 HF 离线加载小节；新增「常见问题（环境依赖）」 | 修改 |
+
+## 三、关键设计说明
+
+- **时序**：`huggingface_hub` / `transformers` / `sentence_transformers` 在**导入时**就把 `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` 读成模块级常量，因此必须在这类库被 import **之前**设置环境变量。本项目统一在 `config.settings` 模块加载时设置（该模块是最早被 import 的入口之一），从根上解决。
+- **双保险**：`utils/embedding_client.py` 与 `bge_reranker.py` 的客户端构造里仍保留设置，防止未来有绕过 settings 的直接 import 场景。
+- **零破坏**：`HF_HUB_OFFLINE=false` 时行为与旧版完全一致（允许联网）；仅当 `true` 时强制离线用本地缓存。
+
+## 四、验证结果
+
+| 场景 | 结果 |
+|------|------|
+| 含内嵌图片 PDF 上传 | ✅ `ready`：文本 1 chunk + 图片 1 张，警告 0 |
+| 直接上传 png | ✅ `ready`：图片向量化 成功=1 失败=0 |
+| 文字描述「黄色的猫」检索 | ✅ 召回 2 张图片（`content_type=image`）+ 1 条文本 |
+
+---
+
+# 修改清单 — 图片向量化后端可插拔（豆包云端多模态）
+
+> 日期：2026-08-16
+> 范围：在既有「本地 Chinese-CLIP 图片向量化」基础上，新增**豆包（火山方舟）云端多模态向量化**后端，
+> 由 `IMAGE_EMBED_PROVIDER` 二选一（local / doubao），解决大批量图片在 CPU 上向量化过慢（181 张约 10 分钟）的问题。
+
+## 一、动机
+
+本地 Chinese-CLIP 是 ViT-Large/14@336（24 层 Transformer），CPU 上每张图数秒；含 181 张内嵌图的课件 PDF
+向量化约 10 分钟，前端长时间卡在「图片向量化中」。豆包 `doubao-embedding-vision` 云端 GPU 推理，
+图文同空间，同样支持「文字描述 → 召回图片」，181 张图约 10 秒。
+
+## 二、方案要点
+
+| 项 | 说明 |
+|----|------|
+| 后端选择 | `IMAGE_EMBED_PROVIDER=local`（本地 CLIP）或 `doubao`（豆包云端） |
+| 豆包模型 | `doubao-embedding-vision-251215`，图文同空间，维度 `DOUBAO_IMAGE_EMBED_DIM`（1024/2048） |
+| 接口 | 火山方舟 Ark 多模态向量化 `POST /embeddings/multimodal`，图片 base64 上传 |
+| 地址 | 标准方舟 `/api/v3`；Agent Plan 个人版专属 `/api/plan/v3`（实测通过，勿混用） |
+| 省钱措施 | 图片先等比压缩（默认长边 512 + JPEG q85）再上传，降低像素面积计费；限流/超时自动重试 |
+| 维度隔离 | 图片集合名带维度 `kb_{id}_img_{dim}`，local(768) 与 doubao(1024) 互不干扰 |
+| 无本地依赖 | provider=doubao 时**不导入 torch/transformers/modelscope**，纯 requests 调用 |
+
+## 三、变更清单
+
+| 文件 | 变更内容 | 类型 |
+|------|---------|------|
+| `config/settings.py` | 新增 `image_embed_provider`（local/doubao）+ `doubao_api_key/base_url/embedding_model/image_embed_dim/timeout/max_retry/image_max_side` 共 7 项配置 | 修改 |
+| `utils/doubao_embedding_client.py` | 新增 `DoubaoEmbeddingClient`：纯 requests 调 Ark embeddings，`embed_image/embed_images/embed_query/embed_texts` + `dimension`，图片压缩 + 限流退避重试，逐张 try-except | 新增 |
+| `utils/multimodal_embedding_client.py` | `get_multimodal_client()` 改为按 provider 分发的工厂：doubao 分支不导入 torch/CLIP | 修改 |
+| `ai/rag_engine/image_retriever.py` | `_img_collection(kb_id, dim)` 集合名带维度隔离；`index_images`/`retrieve_images` 用 `client.dimension`；`clear_document_images` 清理 768/1024/2048 全部旧集合 | 修改 |
+| `.env` / `.env.example` | 新增 `IMAGE_EMBED_PROVIDER` + `DOUBAO_*` 配置块（带注释） | 修改 |
+| `README.md` | 「图片多模态向量化开关」改写为二选一方案 + 省钱/切换说明 | 修改 |
+
+## 四、兼容性（零破坏）
+
+- `IMAGE_EMBED_PROVIDER=local`（默认）时行为与之前完全一致，本地 CLIP 链路不受影响。
+- `ENABLE_IMAGE_EMBED=false` 时依旧全量回退，local 不导入 torch、doubao 不联网。
+- 图片检索链路（`rag_pipeline → image_retriever → client.embed_query`）对两种后端透明，无需改动。
+- 旧集合名 `kb_{id}_img`（无维度后缀）仍被 `clear_document_images` 清理，不产生孤儿向量。
+
+## 五、待办（依赖用户提供有效 Key）
+
+- 当前 `.env` 中 `DOUBAO_API_KEY` 留空。用户提供的 key 实测返回 401（疑似复制截断），
+  待提供完整有效的火山方舟 API Key 后填入即可启用 doubao 后端。
+
+---
+
 *以下为更早的历史变更清单（课程试卷系统改造、DeepSeek 对接、RAG 引擎优化），保留备查。*
 
 ---
@@ -470,3 +557,53 @@ python -X utf8 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
 3. **BM25 索引不持久化**（`bm25_engine.py`）：入库后未落盘、重启后未加载，导致重启后 BM25 召回恒为 0。→ `index_chunks` 后 `save()`，`get_bm25_engine()` 首次创建时 `load_all()`。
 
 > ⚠️ 第 1、3 项涉及 `api/main.py`、`ai/rag_engine/vector_store/chroma_store.py` 两个文件，属于「为保证调试日志功能可用」的最小必要改动；第 1 项 `api/main.py` 在任务约定范围（`ai/rag_engine`）之外，特此标注供确认。
+
+---
+
+# 修改清单 — 登录页面 UI 美化（适配试卷命题系统主题）
+
+> 日期：2026-08-16
+> 范围：仅前端 Streamlit 渲染展示层；后端登录鉴权、RBAC 权限、session 状态、登录/注册接口逻辑**完全未改动**。
+
+## 一、动机
+
+原登录页沿用「企业私有知识库智能助手」旧知识问答系统的 UI：深色渐变背景、`企` 字 logo、
+「企业级 · 私有化 · RAG 检索增强生成平台」副标题，与「课程试卷智能命题校验批改系统」业务不匹配，
+样式简陋、残留旧系统文字。
+
+## 二、变更内容
+
+| 文件 | 变更 | 类型 |
+|------|------|------|
+| `frontend/pages/auth_page.py` | 重写品牌区与页面样式：浅蓝灰教育风渐变背景、居中白色卡片、`卷` 字 logo、试卷系统标题/标语、系统能力简介小字 | 修改 |
+
+## 三、UI 细节
+
+| 项 | 说明 |
+|----|------|
+| 系统标题 | 课程试卷智能命题校验批改系统 |
+| 副标题标语 | 基于多模态 RAG 的习题文档解析、智能命题、试卷校验与自动批改平台 |
+| logo | `卷` 字（贴合试卷主题，替换旧 `企` 字） |
+| 背景 | 浅蓝灰渐变（`#eef3fa → #dfe8f4`），清爽稳重，替换旧深色渐变 |
+| 布局 | 居中卡片式，`max-width 640px`，适当留白，不铺满屏幕 |
+| 输入框 | 用户名 + 密码（密码掩码），沿用全局输入框样式 |
+| 登录按钮 | 主色蓝灰渐变按钮（沿用系统主色 `#3b5bdb`） |
+| 系统简介小字 | 卡片底部能力标签：📄 PDF/Word 习题文档解析 · 🖼️ 多模态图片向量化 · 📝 自动生成试卷 · ✅ 校验批改试题 |
+| 注册入口 | 保留「登 录 / 注 册」双标签页，注册页同步适配试卷主题 |
+
+## 四、硬性约束落实情况
+
+- ✅ **后端鉴权/RBAC 逻辑零改动**：`api.post("/api/v1/auth/login")`、`set_auth`、`st.session_state["nav_page"]="kb"`、`st.rerun` 等原有逻辑原样保留，仅改 `_brand_block` / `_AUTH_PAGE_CSS` / 新增 `_intro_block`。
+- ✅ **去除旧系统残留**：登录页不再出现「企业私有知识库」「知识问答」「企」字 logo、「企业级 · 私有化 · RAG」等旧文案。
+- ✅ **登录成功跳转原主页**：登录后仍跳转【课程库】页面，侧边栏及全部业务页面（课件管理、试卷中心、智能问答、Agent 任务、审计日志）未改动。
+- ✅ **原有页面保留**：`chat_page.py` 等原有业务页面按需求「完全保留，不改动」。
+
+## 五、测试要点
+
+| # | 测试项 | 预期 |
+|---|--------|------|
+| 1 | 访问登录页 | 无「知识问答」字样；标题为「课程试卷智能命题校验批改系统」，标语贴合试卷命题业务 |
+| 2 | 正确账号密码登录 | 正常登录，跳转原有【课程库】主页 |
+| 3 | 错误账号密码登录 | 友好错误提示弹出（用户名/密码错误） |
+| 4 | 登录后各功能页 | 课件上传、多模态向量化、命题生成试题等原有功能不受影响 |
+

@@ -92,7 +92,7 @@ curl -s -X POST http://localhost:8000/api/v1/auth/login \
 浏览器访问 `http://localhost:8501`：
 
 1. 出现登录页（居中卡片样式）→ 前端容器正常
-2. 使用 `admin / admin123456` 或刚注册的账号登录成功 → 前端已通过 `FRONTEND_API_BASE_URL=http://backend:8000` 连通后端
+2. 使用 `admin / Teacher@123` 或刚注册的账号登录成功 → 前端已通过 `FRONTEND_API_BASE_URL=http://backend:8000` 连通后端
 3. 创建知识库、上传一个 MD 文档、发起一次问答 → 全链路（前端 → 后端 → RAG 引擎 → 向量库）正常
 
 ### 4. 容器内直连验证

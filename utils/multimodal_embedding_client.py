@@ -182,16 +182,22 @@ class MultimodalEmbeddingClient:
 
 
 # ==================== 工厂 ====================
-_instance: Optional[MultimodalEmbeddingClient] = None
+_instance = None
 _initialized = False
 
 
-def get_multimodal_client() -> Optional[MultimodalEmbeddingClient]:
+def get_multimodal_client():
     """
-    获取多模态嵌入客户端单例（懒加载）。
+    获取多模态嵌入客户端单例（懒加载，按 provider 分发）。
+
+    provider 取值（config.settings.image_embed_provider）：
+    - local ：本地 Chinese-CLIP（modelscope，进程内推理，需要 torch/transformers）
+    - doubao：豆包云端多模态向量化（纯 requests，无需本地 GPU / 大模型）
 
     Returns:
         客户端实例；功能关闭 / 初始化失败时返回 None（调用方需兜底）。
+        两种 provider 的客户端都提供 embed_image/embed_images/embed_query/embed_texts
+        以及 dimension 属性，接口一致，image_retriever 无需感知差异。
     """
     global _instance, _initialized
     if _initialized:
@@ -202,12 +208,20 @@ def get_multimodal_client() -> Optional[MultimodalEmbeddingClient]:
         logger.debug("图片向量化已关闭（ENABLE_IMAGE_EMBED=false）")
         return None
 
-    # 关键：只有开关开启时才导入重依赖，开关关闭时完全不 import torch/transformers/modelscope
+    provider = getattr(settings, "image_embed_provider", "local")
+
     try:
-        _instance = MultimodalEmbeddingClient()
+        if provider == "doubao":
+            # 豆包云端：不导入 torch/transformers/modelscope
+            from utils.doubao_embedding_client import DoubaoEmbeddingClient
+            _instance = DoubaoEmbeddingClient()
+        else:
+            # 本地 Chinese-CLIP：仅在此分支导入重依赖
+            _instance = MultimodalEmbeddingClient()
     except Exception as e:
         logger.warning(
-            f"多模态嵌入模型加载失败，图片向量化将不可用（文本业务不受影响）: {e}"
+            f"多模态嵌入模型加载失败，图片向量化将不可用（文本业务不受影响）: "
+            f"provider={provider}, err={e}"
         )
         _instance = None
     return _instance

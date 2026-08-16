@@ -85,11 +85,22 @@ class Settings(BaseSettings):
     embedding_model: str = Field(default="BAAI/bge-small-zh-v1.5")
     embedding_dimension: int = Field(default=512)
     embedding_batch_size: int = Field(default=32)
+    # HuggingFace 模型离线加载开关：模型已本地缓存时置 true，避免每次联网校验
+    # （国内网络 huggingface.co 常因 SSL 证书/网络原因连不上导致加载失败）
+    hf_hub_offline: bool = Field(
+        default=True, description="HuggingFace 模型离线加载（true=不联网，用本地缓存）"
+    )
 
-    # ========== 多模态图片嵌入配置（本地 Chinese-CLIP，可选开关）==========
+    # ========== 多模态图片嵌入配置（可选开关）==========
     enable_image_embed: bool = Field(
         default=False, description="图片向量化总开关；关闭则完全退回原文本 RAG 行为"
     )
+    # 图片向量化后端：local=本地 Chinese-CLIP（modelscope），doubao=豆包云端多模态向量化
+    image_embed_provider: Literal["local", "doubao"] = Field(
+        default="local", description="图片向量化后端 local/doubao"
+    )
+
+    # ---- 本地 Chinese-CLIP（provider=local 时生效）----
     # 模型名：默认用 modelscope 开源的 chinese-clip-vit-large-patch14-336px
     # （modelscope 模型 id：damo/multi-modal_clip-vit-large-patch14_336_zh）。
     # 可通过 .env 的 CLIP_MODEL_NAME 更换为任意 modelscope id 或本地目录路径。
@@ -113,6 +124,26 @@ class Settings(BaseSettings):
         default=3, description="Chinese-CLIP 模型下载重试次数，全部失败则关闭图片向量化功能",
     )
 
+    # ---- 豆包云端多模态向量化（provider=doubao 时生效，进程外 API 调用）----
+    doubao_api_key: str = Field(default="", description="火山方舟 API Key（ARK_API_KEY）")
+    doubao_base_url: str = Field(
+        default="https://ark.cn-beijing.volces.com/api/v3",
+        description="火山方舟 Ark API 地址。标准方舟用 /api/v3；Agent Plan 个人版用 /api/plan/v3",
+    )
+    doubao_embedding_model: str = Field(
+        default="doubao-embedding-vision-251215",
+        description="豆包多模态向量化模型（文本+图片同空间）。dimensions 参数需 250615 及以上版本",
+    )
+    doubao_image_embed_dim: int = Field(
+        default=1024, description="豆包图片向量维度（1024 或 2048，越小越省存储/费用）"
+    )
+    doubao_timeout: float = Field(default=60.0, description="豆包向量化调用超时（秒）")
+    doubao_max_retry: int = Field(default=3, description="豆包调用重试次数（限流/超时退避）")
+    doubao_image_max_side: int = Field(
+        default=512,
+        description="豆包模式下图片压缩最大边长（压缩越小 token 越少越省钱，建议 448~640）",
+    )
+
     # ---- 兼容旧配置（保留，缺省回退到上面的 clip_* 新配置）----
     multimodal_embedding_model: str = Field(
         default="",
@@ -127,10 +158,14 @@ class Settings(BaseSettings):
     )
     image_vector_top_k: int = Field(default=5, description="图片向量召回条数")
 
-    @field_validator("multimodal_embedding_timeout", "image_max_side", mode="before")
+    @field_validator(
+        "multimodal_embedding_timeout", "image_max_side", "doubao_timeout",
+        "doubao_image_embed_dim", "doubao_max_retry", "doubao_image_max_side",
+        mode="before",
+    )
     @classmethod
     def _empty_numeric_to_default(cls, v, info):
-        """兼容旧 .env 中留空的数值项（如 IMAGE_MAX_SIDE=），空字符串回退默认值，避免启动报错"""
+        """兼容旧 .env 中留空的数值项，空字符串回退默认值，避免启动报错"""
         if isinstance(v, str) and not v.strip():
             return cls.model_fields[info.field_name].default
         return v
@@ -286,3 +321,11 @@ def get_settings() -> Settings:
 
 
 settings = get_settings()
+
+# 立即应用 HuggingFace 离线模式，必须在此处（模块加载时）设置，早于任何
+# huggingface_hub / transformers / sentence_transformers 的导入。
+# 这些库在「导入时」就把 HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE 读成常量，
+# 若等到客户端 __init__ 里再设 env 就太迟了（此前已因此导致本地模型加载时仍联网报 SSL 错）。
+if settings.hf_hub_offline:
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")

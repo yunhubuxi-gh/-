@@ -60,7 +60,7 @@ def ask(header: dict, kb_id: int, query: str) -> dict:
 
 def main():
     kb_id = int(sys.argv[1]) if len(sys.argv) > 1 else 4
-    header = {"Authorization": f"Bearer {login('admin', 'admin123456')}"}
+    header = {"Authorization": f"Bearer {login('admin', 'Teacher@123')}"}
 
     docs = sorted(glob.glob(os.path.join(DEMO_DIR, "*")))
     docs = [d for d in docs if d.lower().endswith((".md", ".txt"))]

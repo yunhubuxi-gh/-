@@ -58,6 +58,7 @@ class LLMClient:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         model: Optional[str] = None,
+        thinking_disabled: bool = False,
         **kwargs,
     ) -> str:
         """
@@ -68,19 +69,30 @@ class LLMClient:
             temperature: 采样温度，默认取配置
             max_tokens: 最大输出 token 数
             model: 覆盖默认模型
+            thinking_disabled: True 时关闭 DeepSeek 推理模型的思考模式
+                （thinking={"type":"disabled"}），避免 reasoning 吃光 max_tokens
+                导致 content 为空——出题/校验等需要稳定结构化 JSON 输出的场景必须置 True。
             **kwargs: 其他传递给 OpenAI API 的参数
 
         Returns:
             模型生成的文本内容
         """
         try:
-            response = self._client.chat.completions.create(
+            # 思考模式控制：DeepSeek v4 推理模型默认开启思考，reasoning 会先于 content 输出，
+            # 若 reasoning 吃满 max_tokens 则 content 为空。结构化输出场景关闭思考。
+            extra_body = kwargs.pop("extra_body", None) or {}
+            if thinking_disabled:
+                extra_body["thinking"] = {"type": "disabled"}
+            create_kwargs = dict(
                 model=model or self.model,
                 messages=messages,
                 temperature=temperature if temperature is not None else self.temperature,
                 max_tokens=max_tokens or self.max_tokens,
                 **kwargs,
             )
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+            response = self._client.chat.completions.create(**create_kwargs)
             content = response.choices[0].message.content or ""
             logger.debug(
                 f"LLM 调用成功: model={self.model}, "

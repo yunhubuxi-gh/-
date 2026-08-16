@@ -14,7 +14,7 @@
 - **知识问答**：基于 BM25 + 向量 + 重排的混合检索增强生成，答案附带文档名 / 页码 / 原文片段引用；
 - **多模态检索**：支持「文字描述 → 召回图片」，PDF 内嵌图与 png/jpg 直接上传，OCR 文本通道与 Chinese-CLIP 图片向量通道**双通道**入库，问答页直接渲染命中图片。
 
-系统具备用户权限隔离（owner/admin/write/read 四级）、完整审计日志、后台异步任务、Docker 一键部署等企业级特性，底层 RAG / Agent / OCR / 多模态全部**进程内本地推理**，无外部依赖。
+系统具备用户权限隔离（owner/admin/write/read 四级）、完整审计日志、后台异步任务、Docker 一键部署等企业级特性。底层 RAG / Agent / OCR 均**进程内本地推理**；图片多模态向量化支持**本地 Chinese-CLIP** 与**豆包云端（火山方舟 Agent Plan 个人版）** 双后端可插拔切换（后者已实测通过，181 张内嵌图约 10 秒完成）。
 
 ---
 
@@ -23,11 +23,11 @@
 1. **双 Agent 智能命题（LangGraph）**：命题 Agent → 校验评审 Agent 两个独立节点串联，逐题 RAG 检索课件原文校验，不合格题自动回传重生成（受 `EXAM_MAX_ITERATE` 上限约束），完整执行轨迹（检索了什么 → 出了什么题 → 逐题校验 → 重生成）可逐轮展开
 2. **知识库溯源批改**：客观题规则判分（选择题精确匹配、填空题关键词匹配），主观题 RAG 检索课件原文 + LLM 判分，每题附课件原文引用，杜绝「大模型凭空判分」
 3. **多路混合召回 + BGE 重排**：BM25 关键词召回 + 向量语义召回双路融合（min-max 归一化加权），BGE-Rerank 精排，显著提升召回准确率、降低幻觉
-4. **图片多模态检索（Chinese-CLIP）**：PDF 内嵌图自动提取 + png/jpg 直接上传，OCR 文本 + CLIP 图片向量双通道入库，支持「文字描述 → 召回图片」；`ENABLE_IMAGE_EMBED` 开关一键关闭即退回纯文本 RAG
+4. **图片多模态检索（Chinese-CLIP / 豆包云端）**：PDF 内嵌图自动提取 + png/jpg 直接上传，OCR 文本 + 图片向量双通道入库，支持「文字描述 → 召回图片」；图片向量化后端可插拔切换本地 Chinese-CLIP 与豆包云端多模态向量化（火山方舟 Agent Plan，实测 181 张图约 10 秒）；`ENABLE_IMAGE_EMBED` 开关一键关闭即退回纯文本 RAG
 5. **语义分块 + 引用溯源**：基于嵌入相似度边界检测的语义分块，回答标注文档名 + 页码 + 原文片段，有据可查
 6. **企业级工程化**：JWT 双令牌鉴权 + 知识库四级权限隔离 + 完整审计日志 + 后台异步任务 + Docker Compose 部署
 7. **可插拔架构**：向量库（Chroma/Milvus 二选一）、大模型（OpenAI 兼容协议）、异步任务引擎（BackgroundTasks/Celery）均可配置切换
-8. **高颜值前端**：Streamlit 全面自定义 CSS 美化，卡片化布局、柔和配色、聊天气泡、流式打字动画、双 Agent 执行轨迹可视化
+8. **高颜值前端**：Streamlit 全面自定义 CSS 美化，卡片化布局、柔和配色、聊天气泡、流式打字动画、双 Agent 执行轨迹可视化，含**试卷主题登录页**（蓝灰教育风、居中卡片、系统能力简介）
 
 ---
 
@@ -222,10 +222,13 @@ source venv/bin/activate          # Windows: venv\Scripts\activate
 
 # 2. 安装依赖（核心运行依赖；启用 Milvus/OCR/BGE-rerank/图片向量化 需取消注释对应行）
 pip install -r requirements.txt
+# 自检关键依赖（缺 PyMuPDF 会导致 PDF 解析失败，缺 sentence-transformers 会导致文本向量化失败）
+python -c "import fitz, sentence_transformers, chromadb; print('核心依赖 OK')"
 
 # 3. 配置环境变量
 cp .env.example .env              # Windows: copy .env.example .env
 # 编辑 .env：填入 LLM_API_KEY、按需调整数据库/向量库/图片向量化开关
+# 注意：HF_HUB_OFFLINE=true（默认）表示 BGE/BGE-Rerank 等 HF 模型走本地缓存、不联网加载
 
 # 4. 初始化数据库（建表 + 创建默认管理员，复用 db/init_db.py）
 python -m db.init_db
@@ -265,12 +268,13 @@ docker-compose ps
 
 | 账号 | 密码 | 角色 | 说明 |
 |------|------|------|------|
-| `admin` | `admin123456` | 系统管理员（admin） | 全局管理，可创建课程库并拥有 owner 全权限 |
-| `demo` | `demo123456` | 普通用户（normal） | 演示用户，可用于测试权限隔离（需被 owner 添加为成员） |
+| `admin` | `Teacher@123` | 管理员 / 教师（admin） | 全局管理，创建课程库后拥有 owner 全权限 |
+| `demo` | `Student@123` | 学生（normal） | 演示学生，需被教师加为课程库 read 成员后在线答题 |
+| `stu2` | `Student@123` | 学生（normal） | 第二名演示学生（测试用） |
 
 **演示建议**：
-1. 用 `admin` 登录 → 创建课程库 → 上传课件（PDF/Word/MD）→ 智能问答 → 生成试卷（体验完整出卷链路）；
-2. 试卷就绪后，用 `demo` 账号（被添加为 read 成员）在线作答，观察客观题规则判分 + 主观题溯源批改；
+1. 用 `admin`（教师）登录 → 创建课程库 → 上传课件（PDF/Word/MD）→ 智能问答 → 生成试卷（体验完整出卷链路）；
+2. 试卷就绪后，用 `demo` / `stu2`（学生，被加为 read 成员）在线作答，观察客观题规则判分 + 主观题溯源批改；
 3. 上传图片或含图 PDF（开启 `ENABLE_IMAGE_EMBED=true`），用文字描述提问召回图片。
 
 > ⚠️ 生产环境请**立即修改默认密码**（登录后右上角「修改密码」），或删除默认账号。
@@ -288,6 +292,19 @@ LLM_BASE_URL=https://api.deepseek.com
 LLM_API_KEY=sk-xxx
 LLM_MODEL=deepseek-v4-flash
 ```
+
+### HuggingFace 模型离线加载（BGE 嵌入 / BGE-Rerank）
+
+```bash
+# true（默认）：BGE / BGE-Rerank 等 HuggingFace 模型走本地缓存、不联网加载
+#   —— 国内网络 huggingface.co 常因 SSL 证书/网络问题连不上，导致模型加载失败；
+#      首次使用前需先把模型下载到本地缓存（见下方「常见问题」）。
+HF_HUB_OFFLINE=true
+
+# false：允许联网加载（首次下载模型时需设为 false，或提前手动下载缓存）
+```
+
+> 该开关在 `config/settings.py` **模块加载时**即写入 `HF_HUB_OFFLINE` / `TRANSFORMERS_OFFLINE` 环境变量（早于任何 HF 库导入），保证离线模式真正生效。
 
 ### 向量库切换
 
@@ -322,22 +339,47 @@ EXAM_RAG_TOP_K=6              # 出题/校验 RAG 召回课件原文条数
 EXAM_TEMPERATURE=0.0          # 出题/校验温度（0=稳定）
 ```
 
-### 图片多模态向量化开关（Chinese-CLIP）
+> 🧠 **DeepSeek 推理模型思考模式**：`deepseek-v4-flash` / `deepseek-v4-pro` 默认开启思考模式，`reasoning_content` 会先于 `content` 输出；若 `reasoning` 吃满 `max_tokens`，则 `content` 返回空、出题/校验解析失败（且仅增大 `max_tokens` 无效——给多少思考就用多少）。本项目已在出题/校验节点的 LLM 调用中显式**关闭思考模式**（`thinking={"type":"disabled"}`），保证结构化 JSON 稳定输出；普通对话问答不受影响。
+
+### 图片多模态向量化开关（本地 Chinese-CLIP 或 豆包云端）
+
+图片向量化后端二选一，由 `IMAGE_EMBED_PROVIDER` 决定，均支持「文字描述 → 召回图片」跨模态检索：
 
 ```bash
-# 开启图片向量化（默认关闭，关闭即退回纯文本 RAG，不加载多模态模型）
-ENABLE_IMAGE_EMBED=true
+ENABLE_IMAGE_EMBED=true              # 图片向量化总开关（false 时退回纯文本 RAG，不加载多模态）
+IMAGE_EMBED_PROVIDER=local           # local=本地 Chinese-CLIP；doubao=豆包云端
+
+# ---------- 方案一：local 本地 Chinese-CLIP（无需付费，CPU 慢）----------
 CLIP_MODEL_NAME=damo/multi-modal_clip-vit-large-patch14_336_zh   # modelscope 模型 id 或本地 HF 目录
-CLIP_DEVICE=auto               # auto/cuda/cpu；auto 优先 cuda，无 GPU 自动降级 cpu
-CLIP_MAX_IMAGE_SIDE=336        # 图片预处理最大边长（等比例缩放，防 CLIP 推理 OOM）
-CLIP_MIN_IMAGE_SIDE=32         # 图片预处理最小边长，低于此值的极小无效图直接过滤
-CLIP_DOWNLOAD_RETRY=3          # 模型下载重试次数，全部失败则关闭图片向量化（文本业务不受影响）
-IMAGE_VECTOR_TOP_K=5           # 图片向量召回条数
+CLIP_DEVICE=auto                     # auto/cuda/cpu
+CLIP_MAX_IMAGE_SIDE=336              # 图片预处理最大边长
+CLIP_MIN_IMAGE_SIDE=32               # 过滤极小图
+CLIP_DOWNLOAD_RETRY=3                # 模型下载重试次数
+
+# ---------- 方案二：doubao 豆包云端多模态向量化（快，按量付费 / Agent Plan 套餐）----------
+DOUBAO_API_KEY=                      # 火山方舟 API Key（Agent Plan 个人版用专属 key）
+# 接口地址二选一（勿混用，否则 401）：
+#   标准方舟（按量付费）      : https://ark.cn-beijing.volces.com/api/v3
+#   Agent Plan 个人版（套餐）  : https://ark.cn-beijing.volces.com/api/plan/v3（含 /plan）
+DOUBAO_BASE_URL=https://ark.cn-beijing.volces.com/api/plan/v3
+DOUBAO_EMBEDDING_MODEL=doubao-embedding-vision-251215   # dimensions 需 250615 及以上版本
+DOUBAO_IMAGE_EMBED_DIM=1024          # 向量维度 1024/2048，越小越省
+DOUBAO_TIMEOUT=60
+DOUBAO_MAX_RETRY=3                   # 限流/超时重试
+DOUBAO_IMAGE_MAX_SIDE=512            # 图片压缩最大边长（越小 token 越少越省钱）
+
+IMAGE_VECTOR_TOP_K=5                 # 图片向量召回条数
 ```
 
-> 📦 **懒加载 + 本地推理**：CLIP 模型**不是服务启动就加载**，而是第一次真正处理图片时才从 modelscope 下载（约 1.6GB）并加载；下载/加载失败会自动关闭图片向量化、日志告警，系统继续跑文本业务，绝不导致服务崩溃。关闭 `ENABLE_IMAGE_EMBED=false` 时不导入 torch/transformers/modelscope，缺依赖也能正常启动。
+> ⚡ **豆包云端（推荐生产/大批量）**：181 张内嵌图片 PDF 的图片向量化从本地 CPU 的「约 10 分钟」缩短到「约 10 秒」。豆包按图片像素面积计费，客户端会先等比压缩图片（默认长边 512 + JPEG 质量 85）再上传，降低 token 消耗。
 >
-> 图片向量化依赖为**可选**（requirements.txt 中默认注释），需启用时取消注释 `torch / transformers / modelscope / pillow` 后重装即可。
+> ✅ **Agent Plan 个人版已实测通过**：专属地址 `https://ark.cn-beijing.volces.com/api/plan/v3` + 专属 API Key（`ark-` 开头，完整复制，勿截断）+ 模型 `doubao-embedding-vision-251215` + 维度 1024。注意与标准方舟按量付费地址 `/api/v3`、Coding Plan 地址 `/api/coding/v3` 三者**不能混用**，否则返回 401。
+>
+> 📦 **本地 Chinese-CLIP（离线/免费）**：`IMAGE_EMBED_PROVIDER=local` 时走 modelscope 下载 + 进程内推理，无需联网/付费，但 CPU 上图片多时较慢，建议有 GPU 或图片量小的场景使用。
+>
+> 🔒 **懒加载 + 容错**：两种后端都是**首次处理图片才初始化**（非服务启动）；初始化/调用失败会关闭图片向量化、日志告警、文本业务继续。`ENABLE_IMAGE_EMBED=false` 时 local 分支不导入 torch/transformers/modelscope，doubao 分支不联网，缺依赖也不报错。
+>
+> ⚠️ **切换后端要重传图片**：local 与 doubao 向量维度不同（768 vs 1024），图片向量存独立集合（`kb_{id}_img_{dim}` 自动隔离）。切换 provider 后旧图片向量维度不匹配，需重新上传（或重建索引）才能被新后端检索到。
 
 ---
 
@@ -355,6 +397,43 @@ python tests/test_step6_api.py       # API 接口层（鉴权/权限/异常格�
 ```
 
 图片多模态功能的专项测试见 [TEST_IMAGE_GUIDE.md](TEST_IMAGE_GUIDE.md)（含图 PDF 子状态与部分损坏降级、jpg 召回、开关回退、模型下载失败降级 4 个用例）。
+
+---
+
+## ❓ 常见问题（环境依赖）
+
+### 1. 上传 PDF 报 `PyMuPDF 未安装` / PDF 解析失败
+
+**原因**：当前 Python 环境缺少 PDF 解析库 `pymupdf`（`import fitz`）。
+
+**解决**：
+```bash
+pip install PyMuPDF==1.24.10
+```
+
+### 2. 文档向量化失败，日志出现 `huggingface.co ... SSL: CERTIFICATE_VERIFY_FAILED`
+
+**原因**：BGE 嵌入模型虽已本地缓存，但加载时仍尝试联网去 huggingface.co 校验，撞上国内 SSL 证书错误。
+
+**解决**：确保 `.env` 中 `HF_HUB_OFFLINE=true`（默认），让模型走本地缓存、不联网加载。若模型尚未缓存，需先临时 `HF_HUB_OFFLINE=false` 或手动下载：
+```bash
+# 方式一：临时联网下载（下载完再改回 true）
+HF_HUB_OFFLINE=false python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-zh-v1.5')"
+
+# 方式二：用镜像下载后再离线加载（国内推荐）
+HF_ENDPOINT=https://hf-mirror.com python -c "from huggingface_hub import snapshot_download; snapshot_download('BAAI/bge-small-zh-v1.5')"
+```
+
+> 关键点：`HF_HUB_OFFLINE` 必须在**导入 huggingface_hub 之前**设置（本项目已在 `config/settings.py` 模块加载时设置），否则库会把它读成常量而失效。
+
+### 3. 日志出现 `OCR 引擎初始化失败` / 扫描件 PDF 无文本
+
+**说明**：OCR 是**可选**依赖（仅扫描件 PDF 的文字识别用），普通文本 PDF / 图片向量化不受影响。本项目适配 **PaddleOCR 3.x**（已移除 `use_angle_cls` / `show_log` / `cls` 等旧参数，改用 `predict()` + `OCRResult` 新返回结构），并默认使用 **mobile 模型 + 关闭文档矫正/方向分类**（每页约 2~3 秒，server 版每页约 80 秒）。需要时完整安装：
+```bash
+pip install paddleocr==3.2.0 paddlepaddle==3.1.1 opencv-contrib-python==4.10.0.84 einops ftfy premailer
+```
+
+> ⚠️ 常见坑：`opencv-contrib-python`（而非 `opencv-python`）是 PaddleOCR 3.x 的必需依赖；`paddlepaddle` 需保证 `libpaddle.pyd` 完整（缺失会导致 `cannot import name 'libpaddle'` 循环导入报错）。若曾装过 `opencv-python` 请先卸载再装 contrib 版，否则 `import cv2` 会报 `recursion is detected`。
 
 ---
 

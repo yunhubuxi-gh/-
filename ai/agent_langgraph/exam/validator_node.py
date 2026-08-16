@@ -69,6 +69,7 @@ def _validate_one(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            thinking_disabled=True,
         )
         obj = extract_json_object(raw or "") or {}
         verdict = str(obj.get("verdict", "")).strip().lower()

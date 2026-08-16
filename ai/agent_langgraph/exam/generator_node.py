@@ -160,6 +160,7 @@ def make_generator_node(
                     temperature=temperature,
                     max_tokens=max_tokens,
                     timeout=timeout,
+                    thinking_disabled=True,
                 )
                 new_questions = _normalize_questions(extract_questions(raw or ""))
             except Exception as e:

@@ -29,8 +29,10 @@ logger = get_logger(__name__)
 _IMG_COLLECTION_SUFFIX = "_img"
 
 
-def _img_collection(kb_id: Any) -> str:
-    return f"kb_{kb_id}{_IMG_COLLECTION_SUFFIX}"
+def _img_collection(kb_id: Any, dim: Optional[int] = None) -> str:
+    """图片向量集合名：按维度隔离（local=768、doubao=1024/2048 各自独立集合，避免维度冲突）"""
+    base = f"kb_{kb_id}{_IMG_COLLECTION_SUFFIX}"
+    return f"{base}_{dim}" if dim else base
 
 
 class ImageRetriever:
@@ -85,7 +87,9 @@ class ImageRetriever:
             return 0, warnings
 
         store = self._get_vector_store()
-        collection = _img_collection(knowledge_base_id)
+        # 集合名带维度：不同 provider/维度（local 768 / doubao 1024）写入各自集合，互不干扰
+        dim = getattr(client, "dimension", None)
+        collection = _img_collection(knowledge_base_id, dim)
 
         ids: List[str] = []
         metas: List[Dict] = []
@@ -140,15 +144,21 @@ class ImageRetriever:
         return len(ids), warnings
 
     def clear_document_images(self, knowledge_base_id: Any, document_id: Any) -> None:
-        """删除某文档的全部图片向量（文档删除 / 重建时调用，避免孤儿向量）"""
-        try:
-            self._get_vector_store().delete_by_document_id(
-                _img_collection(knowledge_base_id), str(document_id),
-            )
-        except Exception as e:
-            logger.warning(
-                f"清除文档图片向量失败: kb={knowledge_base_id}, doc={document_id}, err={e}"
-            )
+        """删除某文档的全部图片向量（文档删除 / 重建时调用，避免孤儿向量）。
+
+        尝试清理所有可能的维度集合（768/1024/2048），覆盖切换 provider 前后的旧集合，
+        不存在集合时 store 静默返回，不报错。
+        """
+        for dim in (None, 768, 1024, 2048):
+            try:
+                self._get_vector_store().delete_by_document_id(
+                    _img_collection(knowledge_base_id, dim), str(document_id),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"清除文档图片向量失败: kb={knowledge_base_id}, doc={document_id}, "
+                    f"dim={dim}, err={e}"
+                )
 
     # ---------- 图片检索 ----------
 
@@ -173,11 +183,12 @@ class ImageRetriever:
 
         top_k = top_k or settings.image_vector_top_k
         store = self._get_vector_store()
+        dim = getattr(client, "dimension", None)
 
         results: List[RetrievedChunk] = []
         for kb_id in knowledge_base_ids:
             try:
-                hits = store.search(_img_collection(kb_id), query_vec, top_k=top_k)
+                hits = store.search(_img_collection(kb_id, dim), query_vec, top_k=top_k)
             except Exception as e:
                 logger.warning(f"图片向量检索失败: kb={kb_id}, err={e}")
                 continue

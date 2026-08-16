@@ -3,7 +3,7 @@
 
 功能：
 1. 创建所有数据表
-2. 初始化默认管理员账号（admin / admin123456）
+2. 初始化默认管理员账号（admin / Teacher@123）
 3. 可选：创建示例知识库与示例用户
 
 使用方式：
@@ -49,13 +49,13 @@ def init_default_admin() -> None:
             db,
             UserCreate(
                 username="admin",
-                password="admin123456",
+                password="Teacher@123",
                 email="admin@example.com",
                 nickname="系统管理员",
                 role=UserRole.ADMIN.value,
             ),
         )
-        logger.info(f"✅ 默认管理员创建成功: {admin.username} / admin123456")
+        logger.info(f"✅ 默认管理员创建成功: {admin.username} / Teacher@123")
         logger.warning("⚠️  生产环境请立即修改默认密码！")
 
     finally:
@@ -75,13 +75,13 @@ def init_demo_user() -> None:
             db,
             UserCreate(
                 username="demo",
-                password="demo123456",
+                password="Student@123",
                 email="demo@example.com",
                 nickname="演示用户",
                 role=UserRole.NORMAL.value,
             ),
         )
-        logger.info(f"✅ 演示用户创建成功: {demo.username} / demo123456")
+        logger.info(f"✅ 演示用户创建成功: {demo.username} / Student@123")
     finally:
         db.close()
 
@@ -89,7 +89,7 @@ def init_demo_user() -> None:
 def init_all() -> None:
     """完整初始化"""
     print("=" * 60)
-    print("🚀 企业私有知识库智能助手 - 数据库初始化")
+    print("🚀 课程试卷智能命题校验批改系统 - 数据库初始化")
     print("=" * 60)
 
     logger.info("开始数据库初始化...")
@@ -105,8 +105,8 @@ def init_all() -> None:
 
     print("=" * 60)
     print("🎉 数据库初始化完成！")
-    print(f"   默认管理员: admin / admin123456")
-    print(f"   演示用户:   demo / demo123456")
+    print(f"   默认管理员: admin / Teacher@123")
+    print(f"   演示用户:   demo / Student@123")
     print("=" * 60)
 
 

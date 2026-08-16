@@ -59,12 +59,21 @@ class PaddleOCREngine(BaseOCREngine):
             ) from e
 
         lang = settings.ocr_lang
-        # use_angle_cls=True 支持倾斜文本检测
-        self._ocr = PaddleOCR(use_angle_cls=True, lang=lang, show_log=False)
-        logger.info(f"PaddleOCR 引擎初始化完成: lang={lang}")
+        # PaddleOCR 3.x 已移除 use_angle_cls / show_log 参数。
+        # 用 mobile 版模型 + 关闭文档矫正/方向分类/文本行方向等预处理，大幅提速：
+        # server 版每页约 80s，mobile 版 + 关预处理可降到每页数秒。
+        self._ocr = PaddleOCR(
+            lang=lang,
+            text_detection_model_name="PP-OCRv5_mobile_det",
+            text_recognition_model_name="PP-OCRv5_mobile_rec",
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+        )
+        logger.info(f"PaddleOCR 引擎初始化完成: lang={lang}（mobile 模型，关闭文档矫正/方向分类）")
 
     def recognize_image(self, image_path: str) -> str:
-        result = self._ocr.ocr(image_path, cls=True)
+        result = self._ocr.predict(image_path)
         return self._extract_text(result)
 
     def recognize_image_bytes(self, image_bytes: bytes) -> str:
@@ -72,22 +81,31 @@ class PaddleOCREngine(BaseOCREngine):
         import cv2
         nparr = np.frombuffer(image_bytes, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        result = self._ocr.ocr(img, cls=True)
+        result = self._ocr.predict(img)
         return self._extract_text(result)
 
     def _extract_text(self, ocr_result) -> str:
-        """从 PaddleOCR 结果中提取文本"""
+        """从 PaddleOCR 结果中提取文本。
+
+        PaddleOCR 3.x 的 predict() 返回 list[OCRResult]；OCRResult 是 dict-like 对象，
+        其 .json 形如 {"res": {"rec_texts": [...], "rec_scores": [...]}}。
+        """
         if not ocr_result:
             return ""
-        # PaddleOCR 返回结构：[[ [box, (text, score)], ... ]]
-        texts = []
-        for page in ocr_result:
-            if page is None:
+        items = ocr_result if isinstance(ocr_result, (list, tuple)) else [ocr_result]
+        texts: List[str] = []
+        for item in items:
+            if item is None:
                 continue
-            for line in page:
-                if len(line) >= 2:
-                    text = line[1][0]
-                    texts.append(text)
+            try:
+                j = item.json
+                if not isinstance(j, dict):
+                    j = item.get("res", {}) if hasattr(item, "get") else {}
+            except Exception:
+                j = {}
+            inner = j.get("res", {}) if isinstance(j, dict) else {}
+            if isinstance(inner, dict):
+                texts.extend(str(t) for t in (inner.get("rec_texts") or []) if t)
         return "\n".join(texts)
 
 
@@ -122,14 +140,28 @@ class TesseractEngine(BaseOCREngine):
 
 # ==================== 工厂函数 ====================
 _instance: Optional[BaseOCREngine] = None
+_init_failed: bool = False
+_lock = None  # 延迟创建线程锁，避免导入期开销
+
+
+def _get_lock():
+    global _lock
+    if _lock is None:
+        import threading
+        _lock = threading.Lock()
+    return _lock
 
 
 def get_ocr_engine() -> Optional[BaseOCREngine]:
     """
     获取 OCR 引擎单例。
     如果 OCR 未启用或初始化失败，返回 None，调用方需做兜底处理。
+
+    注意：PaddleOCR 底层 PDX 只允许初始化一次，初始化失败后再次 new 会抛
+    「PDX has already been initialized」，故失败后记住状态，后续直接返回 None，
+    避免每处理一页就重复初始化、刷屏日志、浪费性能。
     """
-    global _instance
+    global _instance, _init_failed
 
     if not settings.ocr_enabled:
         logger.debug("OCR 未启用（OCR_ENABLED=false）")
@@ -138,19 +170,31 @@ def get_ocr_engine() -> Optional[BaseOCREngine]:
     if _instance is not None:
         return _instance
 
-    try:
-        engine_type = settings.ocr_engine
-        if engine_type == "paddleocr":
-            _instance = PaddleOCREngine()
-        elif engine_type == "tesseract":
-            _instance = TesseractEngine()
-        else:
-            logger.warning(f"未知 OCR 引擎: {engine_type}，OCR 将不可用")
-            return None
-        return _instance
-    except Exception as e:
-        logger.warning(f"OCR 引擎初始化失败: {e}，OCR 功能将不可用")
+    if _init_failed:
         return None
+
+    with _get_lock():
+        # 双重检查：拿锁期间可能已被其他线程初始化
+        if _instance is not None:
+            return _instance
+        if _init_failed:
+            return None
+
+        try:
+            engine_type = settings.ocr_engine
+            if engine_type == "paddleocr":
+                _instance = PaddleOCREngine()
+            elif engine_type == "tesseract":
+                _instance = TesseractEngine()
+            else:
+                logger.warning(f"未知 OCR 引擎: {engine_type}，OCR 将不可用")
+                _init_failed = True
+                return None
+            return _instance
+        except Exception as e:
+            _init_failed = True
+            logger.warning(f"OCR 引擎初始化失败: {e}，OCR 功能将不可用（本次进程内不再重试）")
+            return None
 
 
 def is_ocr_available() -> bool:

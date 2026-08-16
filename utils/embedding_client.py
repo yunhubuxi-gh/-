@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional
 
@@ -15,6 +16,13 @@ from config.settings import settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def _apply_hf_offline() -> None:
+    """按配置设置 HuggingFace 离线模式，避免加载本地模型时联网校验失败"""
+    if settings.hf_hub_offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
 class BaseEmbeddingClient(ABC):
@@ -103,6 +111,7 @@ class BgeEmbeddingClient(BaseEmbeddingClient):
                 "sentence-transformers 未安装，请执行 pip install sentence-transformers"
             ) from e
 
+        _apply_hf_offline()
         model_name = settings.embedding_model
         device = getattr(settings, "embedding_device", "cpu")
         self._model = SentenceTransformer(model_name, device=device)
