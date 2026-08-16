@@ -179,17 +179,82 @@ class ExamService:
         return self._to_paper_detail(paper, hide_answer=hide_answer)
 
     def update(self, db, user_id: int, paper_id: int, data: ExamPaperUpdate) -> Dict[str, Any]:
-        """复用旧试卷修改（admin+）"""
+        """编辑试卷（admin+）：标题/难度/题目/参考答案。
+
+        试卷编辑（增删改、单题重出落库）统一走本接口：当提交 questions 时，
+        服务端自动规范化题目、重算参考答案 / 总分 / 题型配置，保证标签云与雷达图数据一致。
+        """
         paper = self._get_paper(db, paper_id)
         self._check_permission(db, paper.knowledge_base_id, user_id, KBUserRole.ADMIN,
                                "exam_update", AuditAction.EXAM_UPDATE.value)
-        paper = exam_paper_crud.update(db, paper_id, data)
+        update_data = data.model_dump(exclude_unset=True)
+        questions = update_data.get("questions")
+        if questions is not None:
+            questions = self._sanitize_questions(questions)
+            update_data["questions"] = questions
+            update_data["reference_answers"] = [
+                {"qid": q.get("qid"), "answer": q.get("answer"),
+                 "knowledge_point": q.get("knowledge_point")}
+                for q in questions
+            ]
+            update_data["total_score"] = sum(int(q.get("score") or 0) for q in questions)
+            cfg = {"choice": 0, "fill": 0, "short": 0}
+            for q in questions:
+                t = q.get("type")
+                if t in cfg:
+                    cfg[t] += 1
+            update_data["question_config"] = cfg
+        paper = exam_paper_crud.update(db, paper_id, ExamPaperUpdate(**update_data))
         write_audit_log(
             db, user_id, AuditAction.EXAM_UPDATE.value,
             resource_type="exam", resource_id=paper_id,
-            details={"kb_id": paper.knowledge_base_id},
+            details={"kb_id": paper.knowledge_base_id, "question_count": len(questions) if questions is not None else None},
         )
         return self._to_paper_detail(paper)
+
+    def regenerate_question(self, db, user_id: int, paper_id: int, qid: int) -> Dict[str, Any]:
+        """试卷编辑「单题重出」（admin+）：仅针对该题调用命题 Agent 重出一题，不动其它题。
+
+        复用 ExamManager 双 Agent 图（命题 → 校验自动复核），重出结果实时写入试卷。
+        """
+        paper = self._get_paper(db, paper_id)
+        self._check_permission(db, paper.knowledge_base_id, user_id, KBUserRole.ADMIN,
+                               "exam_regenerate", AuditAction.EXAM_UPDATE.value)
+        if paper.status != ExamPaperStatus.READY.value:
+            raise ValidationException(OPERATION_NOT_ALLOWED, "试卷尚未就绪，无法重出题目")
+
+        questions = paper.questions or []
+        idx = next((i for i, q in enumerate(questions) if q.get("qid") == qid), None)
+        if idx is None:
+            raise ResourceNotFoundException(EXAM_PAPER_NOT_FOUND, f"试卷中不存在第 {qid} 题")
+
+        manager = self._get_manager()
+        res = manager.regenerate_question(paper.knowledge_base_id, questions[idx], paper.difficulty)
+        if not res.get("success"):
+            raise ValidationException(EXAM_GENERATE_FAILED, res.get("error") or "单题重出失败")
+
+        questions[idx] = res["question"]
+        questions = self._sanitize_questions(questions)
+        update_data = {
+            "questions": questions,
+            "reference_answers": [
+                {"qid": q.get("qid"), "answer": q.get("answer"),
+                 "knowledge_point": q.get("knowledge_point")}
+                for q in questions
+            ],
+            "total_score": sum(int(q.get("score") or 0) for q in questions),
+        }
+        paper = exam_paper_crud.update(db, paper_id, ExamPaperUpdate(**update_data))
+        write_audit_log(
+            db, user_id, AuditAction.EXAM_UPDATE.value,
+            resource_type="exam", resource_id=paper_id,
+            details={"kb_id": paper.knowledge_base_id, "op": "regenerate", "qid": qid,
+                     "warning": res.get("warning")},
+        )
+        detail = self._to_paper_detail(paper)
+        if res.get("warning"):
+            detail["warning"] = res["warning"]
+        return detail
 
     def delete(self, db, user_id: int, paper_id: int) -> bool:
         """删除试卷（owner）"""
@@ -332,28 +397,17 @@ class ExamService:
         answers = data.answers or []
         has_short = any(q.get("type") == ExamQuestionType.SHORT.value for q in questions)
 
-        # 客观题规则判分（同步，不调 LLM）
-        objective_details, objective_score = self._grade_objective_all(questions, answers)
+        # 客观题规则判分（同步，只用于快速返回客观分；完整明细 + 错误解析在后台批改任务完成）
+        _, objective_score = self._grade_objective_all(questions, answers)
 
-        if has_short:
-            # 有主观题：先存客观分，主观题后台批改
-            sheet = answer_sheet_crud.create(
-                db, paper_id, user_id, answers,
-                objective_score=objective_score,
-                status=AnswerSheetStatus.GRADING.value,
-            )
-            task_id = submit_task(self._grade_task, sheet.id)
-        else:
-            # 全客观题：直接完成判分
-            sheet = answer_sheet_crud.create(
-                db, paper_id, user_id, answers,
-                objective_score=objective_score,
-                status=AnswerSheetStatus.GRADED.value,
-            )
-            answer_sheet_crud.set_result(
-                db, sheet.id, objective_details, objective_score, 0, objective_score,
-            )
-            task_id = None
+        # 统一走后台批改任务：客观题答错生成「错误解析」、主观题四维度分项溯源批改，
+        # 全部在后台完成，提交接口快速返回，前端轮询批改状态。
+        sheet = answer_sheet_crud.create(
+            db, paper_id, user_id, answers,
+            objective_score=objective_score,
+            status=AnswerSheetStatus.GRADING.value,
+        )
+        task_id = submit_task(self._grade_task, sheet.id)
 
         write_audit_log(
             db, user_id, AuditAction.EXAM_SUBMIT.value,
@@ -393,22 +447,38 @@ class ExamService:
             # 客观题规则判分（重算，不调 LLM）
             objective_details, objective_score = self._grade_objective_all(questions, answers)
 
-            # 主观题溯源批改（RAG + LLM）
+            # 精细化溯源批改：主观题四维度分项打分；客观题答错生成错误解析
             grader = self._get_grade_manager()
             subjective_score = 0
             for q in questions:
-                if q.get("type") != ExamQuestionType.SHORT.value:
-                    continue
+                qtype = q.get("type")
                 qid = q.get("qid")
-                res = grader.grade_subjective(kb_id, q, ans_map.get(qid, ""))
-                subjective_score += res["score"]
-                objective_details.append({
-                    "qid": qid, "type": q.get("type"),
-                    "score": res["score"], "max_score": res["max_score"],
-                    "strengths": res["strengths"], "missing": res["missing"],
-                    "source_refs": res["source_refs"], "objective": False,
-                    "error": res.get("error"),
-                })
+                if qtype == ExamQuestionType.SHORT.value:
+                    res = grader.grade_subjective(kb_id, q, ans_map.get(qid, ""))
+                    subjective_score += res["score"]
+                    objective_details.append({
+                        "qid": qid, "type": qtype,
+                        "score": res["score"], "max_score": res["max_score"],
+                        "strengths": res["strengths"], "missing": res["missing"],
+                        "source_refs": res["source_refs"],
+                        "dimensions": res.get("dimensions") or [],
+                        "objective": False, "error": res.get("error"),
+                    })
+                elif qtype in (ExamQuestionType.CHOICE.value, ExamQuestionType.FILL.value):
+                    # 客观题答错：补充「错误选项解析 + 考察知识点 + 课件溯源片段」
+                    d = next((x for x in objective_details if x.get("qid") == qid), None)
+                    if d is not None and not d.get("correct"):
+                        detail_res = grader.grade_objective_detail(
+                            kb_id, q, ans_map.get(qid, ""), d.get("score", 0),
+                        )
+                        d["analysis"] = detail_res.get("analysis")
+                        d["knowledge_point"] = detail_res.get("knowledge_point") or q.get("knowledge_point")
+                        refs = list(dict.fromkeys(
+                            (d.get("source_refs") or []) + detail_res.get("source_refs", [])
+                        ))
+                        d["source_refs"] = refs
+                        d["analysis_error"] = detail_res.get("error")
+                        d["objective_explain"] = True
 
             total = objective_score + subjective_score
             answer_sheet_crud.set_result(
@@ -517,6 +587,39 @@ class ExamService:
         diff_label = {"easy": "易", "medium": "中", "hard": "难"}.get(difficulty, difficulty)
         now = datetime.now().strftime("%Y%m%d")
         return f"{kb_name}试卷-{diff_label}等-{now}"
+
+    @staticmethod
+    def _sanitize_questions(questions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """规范化试卷编辑提交的题目：过滤无效项、重新编号 qid、补齐字段、确保选择题选项合法"""
+        valid_types = {t.value for t in ExamQuestionType}
+        clean: List[Dict[str, Any]] = []
+        for q in questions or []:
+            if not isinstance(q, dict):
+                continue
+            qtype = str(q.get("type") or "").strip().lower()
+            if qtype not in valid_types:
+                continue
+            stem = str(q.get("stem") or "").strip()
+            if not stem:
+                continue
+            item = {
+                "type": qtype,
+                "stem": stem,
+                "answer": str(q.get("answer") or "").strip(),
+                "knowledge_point": str(q.get("knowledge_point") or "").strip(),
+                "source_refs": [str(r).strip() for r in (q.get("source_refs") or [])
+                                if str(r).strip()],
+                "score": max(0, int(q.get("score") or 0)),
+            }
+            if qtype == ExamQuestionType.CHOICE.value:
+                options = [str(o).strip() for o in (q.get("options") or []) if str(o).strip()]
+                if len(options) < 2:
+                    continue
+                item["options"] = options
+            clean.append(item)
+        for i, q in enumerate(clean):
+            q["qid"] = i + 1
+        return clean
 
     @staticmethod
     def _to_paper_dict(paper) -> Dict[str, Any]:

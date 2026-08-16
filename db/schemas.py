@@ -349,11 +349,13 @@ class ExamPaperCreate(BaseModel):
 
 
 class ExamPaperUpdate(BaseModel):
-    """复用旧试卷修改"""
+    """复用旧试卷修改 / 试卷编辑（增删改题、单题重出落库）"""
     title: Optional[str] = Field(None, max_length=256)
     difficulty: Optional[str] = Field(None, description="难度")
     questions: Optional[List[Dict[str, Any]]] = Field(None, description="题目列表")
     reference_answers: Optional[List[Dict[str, Any]]] = Field(None, description="参考答案")
+    total_score: Optional[int] = Field(None, description="总分（服务端由题目重算）")
+    question_config: Optional[Dict[str, Any]] = Field(None, description="题型配置（服务端由题目重算）")
 
 
 class ExamPaperResponse(BaseResponse):

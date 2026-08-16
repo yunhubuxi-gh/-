@@ -17,8 +17,9 @@ DOCX（Word）文档解析器（python-docx）
 from __future__ import annotations
 
 import os
-from typing import List, Tuple, Iterator, Union
+from typing import List, Tuple, Iterator, Union, Optional, Callable
 
+from config.settings import settings
 from ai.rag_engine.document_parser.base_parser import (
     BaseDocumentParser,
     ParsedDocument,
@@ -62,7 +63,18 @@ class DocxParser(BaseDocumentParser):
             self._ocr_engine = get_ocr_engine()
         return self._ocr_engine
 
-    def parse(self, file_path: str) -> ParsedDocument:
+    def parse(
+        self,
+        file_path: str,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> ParsedDocument:
+        """
+        Args:
+            file_path: docx 文件路径
+            progress_callback: 可选进度回调 `(done, total)`，每完成一张图片 OCR 调用一次，
+                用于上报细粒度子阶段进度（前端展示「OCR识别中 x/总数」）。
+                回调可能在并发 OCR 的多个工作线程中触发，实现需自行保证线程安全。
+        """
         if not os.path.exists(file_path):
             raise FileOperationException(DOC_PARSE_FAILED, f"文件不存在: {file_path}")
 
@@ -79,7 +91,7 @@ class DocxParser(BaseDocumentParser):
             raise FileOperationException(DOC_PARSE_FAILED, f"DOCX 打开失败: {e}") from e
 
         # 顺序扫描正文 + 图片，产出 pages 与 images（图片绑定逻辑页，OCR 文本参与分块）
-        pages, images = self._scan_to_pages_and_images(doc)
+        pages, images = self._scan_to_pages_and_images(doc, progress_callback=progress_callback)
 
         title = os.path.splitext(os.path.basename(file_path))[0]
         logger.info(
@@ -99,14 +111,35 @@ class DocxParser(BaseDocumentParser):
 
     # ---------- 顺序扫描：正文 + 图片 → 逻辑页 ----------
 
-    def _scan_to_pages_and_images(self, doc) -> Tuple[List[PageText], List[ExtractedImage]]:
+    def _scan_to_pages_and_images(
+        self,
+        doc,
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> Tuple[List[PageText], List[ExtractedImage]]:
         """按文档顺序遍历段落与表格，产出逻辑页文本（正文+图片OCR）与内嵌图片列表。
 
         顺序扫描规则（与旧版 _split_into_pages 的「逐段累积，超 1500 字归档」一致）：
         - 正文段落 / 表格行 → 计入当前逻辑页文本
         - 图片 → 绑定当前逻辑页号（页内序号从 0 递增），其 OCR 文本同样计入当前逻辑页
         - 当前页累计字符达到阈值 → 归档该页，开启新页
+
+        性能增强：先收集全部内容单元，再对图片并发 OCR（ThreadPoolExecutor），
+        最后按文档顺序组装逻辑页——OCR 文本与正文的分页/分块语义与串行版完全一致。
         """
+        # 1. 收集全部内容单元（保持文档顺序）
+        units = list(self._iter_ordered_units(doc))
+
+        # 2. 收集所有图片并并发 OCR，结果按原顺序回填
+        image_positions: List[int] = []   # 图片在原 units 中的下标
+        all_images: List[ExtractedImage] = []
+        for idx, (kind, payload) in enumerate(units):
+            if kind == "image":
+                image_positions.append(idx)
+                all_images.append(payload)
+        ocr_texts = self._ocr_images_concurrent(all_images, progress_callback=progress_callback)
+        ocr_map = {pos: ocr_texts[j] for j, pos in enumerate(image_positions)}
+
+        # 3. 按文档顺序组装逻辑页（与串行版一致的 flush/add 语义）
         pages: List[PageText] = []
         images: List[ExtractedImage] = []
 
@@ -133,15 +166,13 @@ class DocxParser(BaseDocumentParser):
             cur_texts.append(text)
             cur_len += len(text)
 
-        for kind, payload in self._iter_ordered_units(doc):
+        for idx, (kind, payload) in enumerate(units):
             if kind == "text":
                 add_text(payload)
             else:  # image
                 img: ExtractedImage = payload
-                # 图片 OCR（独立 try-except，失败仅该图 OCR 文本为空，不影响图片向量化）
-                ocr_text = self._ocr_image(img.image_bytes)
                 cur_page_images.append(img)
-                add_text(ocr_text)
+                add_text(ocr_map.get(idx, ""))
 
             if cur_len >= CHARS_PER_APPROX_PAGE:
                 flush_page()
@@ -151,6 +182,32 @@ class DocxParser(BaseDocumentParser):
             flush_page()
 
         return pages, images
+
+    def _ocr_images_concurrent(
+        self,
+        images: List[ExtractedImage],
+        progress_callback: Optional[Callable[[int, int], None]] = None,
+    ) -> List[str]:
+        """并发 OCR 一批图片，返回与输入同序的文本列表（单张失败仅该张为空串）。
+
+        说明：PaddleOCR 底层 C++ 预测器非线程安全，多线程并发 predict 会段错误，
+        故并发走**进程池**（utils.ocr_pool，每个子进程独立 PaddleOCR 实例）；
+        进程池不可用时自动降级为串行（ocr_engine 内部锁保护 predict）。
+        """
+        from utils.ocr_pool import ocr_images_concurrent
+
+        if not images:
+            return []
+        image_bytes_list = [img.image_bytes for img in images]
+        try:
+            concurrency = int(getattr(settings, "ocr_concurrency", 4) or 4)
+        except (TypeError, ValueError):
+            concurrency = 4
+        return ocr_images_concurrent(
+            image_bytes_list,
+            progress_callback=progress_callback,
+            max_workers=concurrency,
+        )
 
     def _iter_ordered_units(self, doc) -> Iterator[Tuple[str, Union[str, ExtractedImage]]]:
         """按文档顺序产出内容单元：(kind, payload)。

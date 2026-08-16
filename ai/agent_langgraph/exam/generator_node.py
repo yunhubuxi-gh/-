@@ -134,15 +134,19 @@ def make_generator_node(
             ]
             target_desc = "请按题型配置生成整套试卷"
         else:
-            # 迭代：只重生成不合格题（保持题型与数量一致）
+            # 迭代：只重生成不合格题（保持题型与数量一致），并把校验失败原因传给 LLM
             rejected_desc = "\n".join(
-                f"- 第{r['qid']}题（{r.get('type')}）：{r.get('stem')}" for r in rejected
+                f"- 第{r['qid']}题（{r.get('type')}）：{r.get('stem')}\n"
+                f"  被否原因：{r.get('reject_reason') or '未知'}"
+                for r in rejected
             )
             user_parts = [
                 f"【难度】{difficulty}",
                 f"【课件原文素材】\n{context_text or '（未检索到课件内容）'}",
-                f"【被判定不合格、需重生成的题目】\n{rejected_desc}",
-                "请仅针对上述不合格题目重新出题，保持题型与数量不变，输出同样数量的题目",
+                f"【被判定不合格、需重生成的题目及原因】\n{rejected_desc}",
+                "请仅针对上述不合格题目重新出题（输出题数与不合格题数一致）。"
+                "硬性要求：必须避开被否原因，换用【课件原文素材】中明确存在、能逐字摘录来源的考点重新出题；"
+                "严禁重出与不合格题相同或同类（尤其是超纲、无法溯源）的题目。",
             ]
             target_desc = "重新生成不合格题目"
         user_msg = "\n\n".join(user_parts)

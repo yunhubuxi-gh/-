@@ -87,18 +87,38 @@ def add_document_warning_column() -> None:
     print("  · 已新增 documents.processing_warning 列")
 
 
+def add_document_progress_column() -> None:
+    """给 documents 新增 progress_detail 列（幂等，OCR 等细粒度子阶段进度）"""
+    inspector = inspect(sync_engine)
+    tables = inspector.get_table_names()
+    if "documents" not in tables:
+        print("  · documents 表不存在，跳过 progress_detail 列")
+        return
+    existing = [c["name"] for c in inspector.get_columns("documents")]
+    if "progress_detail" in existing:
+        print("  · documents.progress_detail 列已存在，跳过")
+        return
+    dialect = sync_engine.dialect.name
+    col_type = "JSON" if dialect == "postgresql" else "TEXT"
+    with sync_engine.begin() as conn:
+        conn.execute(text(f"ALTER TABLE documents ADD COLUMN progress_detail {col_type}"))
+    print(f"  · 已新增 documents.progress_detail 列（{col_type}）")
+
+
 def main() -> None:
     print("=" * 60)
     print("课程库 / 试卷改造迁移")
     print("=" * 60)
-    print("[1/4] 扩展 knowledge_bases 表")
+    print("[1/5] 扩展 knowledge_bases 表")
     add_tags_column()
-    print("[2/4] 创建新增表")
+    print("[2/5] 创建新增表")
     create_new_tables()
-    print("[3/4] 扩展 answer_sheets 表")
+    print("[3/5] 扩展 answer_sheets 表")
     add_answer_sheet_error_column()
-    print("[4/4] 扩展 documents 表")
+    print("[4/5] 扩展 documents 表（processing_warning）")
     add_document_warning_column()
+    print("[5/5] 扩展 documents 表（progress_detail）")
+    add_document_progress_column()
     print("=" * 60)
     print("✅ 迁移完成，现有数据已保留")
     print("=" * 60)

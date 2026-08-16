@@ -7,6 +7,7 @@ OCR 引擎封装
 """
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -70,19 +71,28 @@ class PaddleOCREngine(BaseOCREngine):
             use_doc_unwarping=False,
             use_textline_orientation=False,
         )
+        # PaddleOCR 底层 C++ 预测器（PaddleX）**非线程安全**：多线程并发调用同一实例的
+        # predict() 会触发 C++ vector 越界（invalid vector<bool> subscript）甚至段错误。
+        # 用一把锁串行化 predict 调用，保证即使上层用 ThreadPoolExecutor 并发提交，
+        # 也不会崩溃（图片解码可并发，核心推理串行）。
+        import threading
+        self._predict_lock = threading.Lock()
         logger.info(f"PaddleOCR 引擎初始化完成: lang={lang}（mobile 模型，关闭文档矫正/方向分类）")
 
     def recognize_image(self, image_path: str) -> str:
-        result = self._ocr.predict(image_path)
-        return self._extract_text(result)
+        with self._predict_lock:
+            result = self._ocr.predict(image_path)
+            return self._extract_text(result)
 
     def recognize_image_bytes(self, image_bytes: bytes) -> str:
         import numpy as np
         import cv2
         nparr = np.frombuffer(image_bytes, np.uint8)
+        # 解码（cv2.imdecode）线程安全，放在锁外并发执行
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        result = self._ocr.predict(img)
-        return self._extract_text(result)
+        with self._predict_lock:
+            result = self._ocr.predict(img)
+            return self._extract_text(result)
 
     def _extract_text(self, ocr_result) -> str:
         """从 PaddleOCR 结果中提取文本。
@@ -140,7 +150,9 @@ class TesseractEngine(BaseOCREngine):
 
 # ==================== 工厂函数 ====================
 _instance: Optional[BaseOCREngine] = None
-_init_failed: bool = False
+_init_fail_count: int = 0          # 连续初始化失败次数（用于指数退避）
+_init_failed_at: Optional[float] = None   # 最近一次失败时间戳（秒）
+_init_fail_reason: Optional[str] = None   # 最近一次失败原因（供前端告警提示）
 _lock = None  # 延迟创建线程锁，避免导入期开销
 
 
@@ -152,16 +164,35 @@ def _get_lock():
     return _lock
 
 
+def _current_backoff_seconds() -> float:
+    """计算当前指数退避间隔：base * 2^(连续失败次数-1)，上限封顶防无限放大。
+
+    例（base=60s）：第 1 次失败后 60s、第 2 次 120s、第 3 次 240s、第 4 次 480s、
+    之后封顶在 960s。
+    """
+    base = max(1.0, float(getattr(settings, "ocr_retry_interval", 60.0) or 60.0))
+    exponent = min(max(0, _init_fail_count - 1), 4)
+    return base * (2 ** exponent)
+
+
+def _in_backoff() -> bool:
+    """当前是否处于退避等待期（失败后未到可重试时间）"""
+    if _init_failed_at is None:
+        return False
+    return (time.time() - _init_failed_at) < _current_backoff_seconds()
+
+
 def get_ocr_engine() -> Optional[BaseOCREngine]:
     """
     获取 OCR 引擎单例。
     如果 OCR 未启用或初始化失败，返回 None，调用方需做兜底处理。
 
-    注意：PaddleOCR 底层 PDX 只允许初始化一次，初始化失败后再次 new 会抛
-    「PDX has already been initialized」，故失败后记住状态，后续直接返回 None，
-    避免每处理一页就重复初始化、刷屏日志、浪费性能。
+    健壮性增强（不再「一次失败永久禁用」）：
+    - 初始化失败后进入指数退避，退避期内直接返回 None（避免反复初始化刷日志/浪费性能）；
+    - 退避时间到后自动尝试重新初始化，临时故障（模型下载中断、磁盘临时满等）
+      恢复后**无需重启服务**即可重新使用 OCR。
     """
-    global _instance, _init_failed
+    global _instance, _init_fail_count, _init_failed_at, _init_fail_reason
 
     if not settings.ocr_enabled:
         logger.debug("OCR 未启用（OCR_ENABLED=false）")
@@ -170,14 +201,15 @@ def get_ocr_engine() -> Optional[BaseOCREngine]:
     if _instance is not None:
         return _instance
 
-    if _init_failed:
+    # 退避期内：直接返回 None，不重试
+    if _in_backoff():
         return None
 
     with _get_lock():
         # 双重检查：拿锁期间可能已被其他线程初始化
         if _instance is not None:
             return _instance
-        if _init_failed:
+        if _in_backoff():
             return None
 
         try:
@@ -187,14 +219,30 @@ def get_ocr_engine() -> Optional[BaseOCREngine]:
             elif engine_type == "tesseract":
                 _instance = TesseractEngine()
             else:
-                logger.warning(f"未知 OCR 引擎: {engine_type}，OCR 将不可用")
-                _init_failed = True
+                _init_fail_count += 1
+                _init_failed_at = time.time()
+                _init_fail_reason = f"未知 OCR 引擎: {engine_type}"
+                logger.warning(f"OCR 引擎不可用: {_init_fail_reason}（{_current_backoff_seconds():.0f} 秒后可重试）")
                 return None
+            # 初始化成功：重置退避状态
+            _init_fail_count = 0
+            _init_failed_at = None
+            _init_fail_reason = None
             return _instance
         except Exception as e:
-            _init_failed = True
-            logger.warning(f"OCR 引擎初始化失败: {e}，OCR 功能将不可用（本次进程内不再重试）")
+            _init_fail_count += 1
+            _init_failed_at = time.time()
+            _init_fail_reason = str(e)
+            logger.warning(
+                f"OCR 引擎初始化失败（第 {_init_fail_count} 次）: {e}，"
+                f"将在 {_current_backoff_seconds():.0f} 秒后自动重试"
+            )
             return None
+
+
+def get_ocr_failure_reason() -> Optional[str]:
+    """返回最近一次 OCR 初始化失败原因（无失败返回 None），供上层反馈到前端告警"""
+    return _init_fail_reason
 
 
 def is_ocr_available() -> bool:

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from config.constants import ExamQuestionType
 from config.settings import settings
 from utils.logger import get_logger
 
@@ -136,3 +137,85 @@ class ExamManager:
             "error": final_state.get("error"),
             "warning": warning,
         }
+
+    def regenerate_question(
+        self,
+        knowledge_base_id: int,
+        question: Dict[str, Any],
+        difficulty: str = "medium",
+    ) -> Dict[str, Any]:
+        """针对单道题重新命题（试卷编辑「单题重出」，复用现有双 Agent 图）。
+
+        以该题作为「不合格题」喂给命题 Agent → 换考点重出 → 校验 Agent 自动复核：
+        沿用命题 Agent 的「避开被否原因、换课件原文考点、严禁重出同类题」硬性约束。
+
+        Args:
+            question: 待重出的题目（含 qid / type / stem / answer / knowledge_point）
+            difficulty: 试卷难度
+
+        Returns:
+            {
+                "question": 重出后的新题（qid 与原题保持一致）,
+                "warning": 新题若仍未通过校验给出提示,
+                "success": bool,
+                "error": str | None,
+            }
+        """
+        qtype = str(question.get("type") or ExamQuestionType.SHORT.value)
+        deps = ExamDependencies(
+            llm_client=self._get_llm(),
+            rag_pipeline=self._get_rag_pipeline(),
+            max_iterate=1,  # 单题只重出一次，新题交由校验 Agent 自动复核
+            llm_timeout=float(settings.exam_llm_timeout),
+            llm_max_tokens=int(settings.exam_llm_max_tokens),
+            rag_top_k=int(settings.exam_rag_top_k),
+            temperature=float(settings.exam_temperature),
+        )
+
+        try:
+            graph = build_exam_graph(deps)
+            initial_state: ExamState = {
+                "knowledge_base_id": int(knowledge_base_id),
+                "question_config": {qtype: 1},  # 仅用于命题 Agent 按题型检索
+                "difficulty": difficulty,
+                "questions": [question],
+                "rejected_questions": [question],
+                "validation_results": [],
+                "iterate_count": 0,
+                "max_iterate": 1,
+                "trace": [],
+                "status": "generating",
+                "error": None,
+            }
+            final_state = graph.invoke(initial_state)
+        except Exception as e:
+            logger.error(f"单题重出异常: {e}")
+            return {
+                "question": None,
+                "warning": None,
+                "success": False,
+                "error": f"单题重出失败: {e}",
+            }
+
+        questions = final_state.get("questions") or []
+        new_q = next(
+            (q for q in questions if q.get("qid") == question.get("qid")),
+            questions[-1] if questions else None,
+        )
+        if new_q is None:
+            return {
+                "question": None,
+                "warning": None,
+                "success": False,
+                "error": final_state.get("error") or "命题 Agent 未产出新题",
+            }
+
+        # 新题仍被校验判 fail 时给出提示（卷面保留新题，教师可再次重出或人工编辑）
+        rejected = final_state.get("rejected_questions") or []
+        warning = None
+        if any(r.get("qid") == question.get("qid") for r in rejected):
+            warning = "重出题仍未通过校验，建议再次重出或人工编辑"
+            logger.warning(
+                f"单题重出后仍未通过校验: kb={knowledge_base_id}, qid={question.get('qid')}"
+            )
+        return {"question": new_q, "warning": warning, "success": True, "error": None}

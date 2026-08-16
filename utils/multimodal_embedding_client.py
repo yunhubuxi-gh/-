@@ -83,6 +83,8 @@ class MultimodalEmbeddingClient:
         self._model = ChineseCLIPModel.from_pretrained(local_dir).to(self.device).eval()
         self._processor = ChineseCLIPProcessor.from_pretrained(local_dir)
         self.dimension = int(self._model.config.projection_dim)
+        # 推理计数：每处理 clip_gc_interval 张图片做一次完整内存回收（gc + empty_cache）
+        self._inference_count = 0
         logger.info(
             f"多模态嵌入客户端初始化完成: model={self.model_name}, "
             f"device={self.device}, dim={self.dimension}"
@@ -140,19 +142,32 @@ class MultimodalEmbeddingClient:
         valid_idx = []
         for i, p in enumerate(image_paths):
             try:
-                img = Image.open(p).convert("RGB")
-                images.append(img)
+                # 用 with 上下文及时关闭文件句柄，convert 出的图像对象稍后统一释放
+                with Image.open(p) as im:
+                    images.append(im.convert("RGB"))
                 valid_idx.append(i)
             except Exception as e:
                 logger.warning(f"图片读取失败，跳过该图向量化: {p}, err={e}")
         if not images:
             return []
 
-        inputs = self._processor(images=images, return_tensors="pt", padding=True).to(self.device)
-        with torch.no_grad():
-            feats = self._model.get_image_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        vecs = feats.cpu().numpy().tolist()
+        inputs = None
+        feats = None
+        try:
+            inputs = self._processor(images=images, return_tensors="pt", padding=True).to(self.device)
+            with torch.no_grad():
+                feats = self._model.get_image_features(**inputs)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            vecs = feats.cpu().numpy().tolist()
+        finally:
+            # 及时释放中间 tensor 与图像对象，缓解本地 CLIP 内存泄漏/OOM
+            for im in images:
+                try:
+                    im.close()
+                except Exception:
+                    pass
+            del inputs, feats, images
+            self._release_memory()
 
         # 把成功图片的向量按原位置回填，失败的置空
         result: List[List[float]] = []
@@ -164,6 +179,24 @@ class MultimodalEmbeddingClient:
                 result.append([])
         return result
 
+    def _release_memory(self, force: bool = False) -> None:
+        """及时回收内存：每次调用 gc.collect()；每 clip_gc_interval 次做一次完整回收（含 CUDA 缓存）"""
+        import gc
+
+        self._inference_count = getattr(self, "_inference_count", 0) + 1
+        interval = max(1, int(getattr(settings, "clip_gc_interval", 10) or 10))
+        do_full = force or self._inference_count >= interval
+        if do_full:
+            self._inference_count = 0
+        gc.collect()
+        if do_full:
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+
     # ---------- 文本嵌入（查询侧）----------
 
     def embed_query(self, query: str) -> List[float]:
@@ -174,11 +207,17 @@ class MultimodalEmbeddingClient:
 
         if not texts:
             return []
-        inputs = self._processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
-        with torch.no_grad():
-            feats = self._model.get_text_features(**inputs)
-        feats = feats / feats.norm(dim=-1, keepdim=True)
-        return feats.cpu().numpy().tolist()
+        inputs = None
+        feats = None
+        try:
+            inputs = self._processor(text=texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+            with torch.no_grad():
+                feats = self._model.get_text_features(**inputs)
+            feats = feats / feats.norm(dim=-1, keepdim=True)
+            return feats.cpu().numpy().tolist()
+        finally:
+            del inputs, feats
+            self._release_memory()
 
 
 # ==================== 工厂 ====================

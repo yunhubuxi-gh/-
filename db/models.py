@@ -293,6 +293,11 @@ class Document(BaseModel):
         nullable=True,
         comment="处理过程中的警告信息（如部分图片向量化失败，文本已正常入库；不影响整体就绪）",
     )
+    progress_detail = Column(
+        JSON,
+        nullable=True,
+        comment="细粒度子阶段进度，如 {stage:'ocr', done:23, total:56}，供前端展示细分进度",
+    )
 
     # 解析统计
     page_count = Column(Integer, default=0, comment="页数（PDF）")

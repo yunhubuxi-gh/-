@@ -3,14 +3,18 @@
 
 功能：
 - 教师（owner/admin/write）发起试卷生成（双 Agent 出卷，后台异步 + 进度轮询）
-- 历史试卷列表 + 详情（题目 / 参考答案 / 双 Agent 完整执行轨迹）
+- 历史试卷列表 + 详情（题目 / 参考答案 / 双 Agent 完整执行轨迹 / 知识点标签云与雷达图）
+- 编辑模式（owner/admin）：单题重出、编辑题目、删除题目、新增自定义试题，实时写入数据库
+- 批改详情：客观题错误解析 + 溯源，主观题四维度分项打分 + 分项点评 + 各维度溯源
 - 导出 Markdown（含/不含答案）
 权限：read 学生隐藏「生成试卷」，且详情不返回参考答案。
 """
 from __future__ import annotations
 
 import html
+import math
 import time
+from collections import Counter
 
 import streamlit as st
 
@@ -32,6 +36,254 @@ def _list_kb_options():
 
 _DIFF_LABEL = {"easy": "易", "medium": "中", "hard": "难"}
 _TYPE_LABEL = {"choice": "单选题", "fill": "填空题", "short": "简答题"}
+
+
+# ============================================================
+# 知识点分布可视化（标签云 + 雷达图，纯 HTML/SVG，零额外依赖）
+# ============================================================
+
+_PALETTE = ["#7c3aed", "#3b5bdb", "#0f9d8f", "#e8590c", "#c2255c", "#2f9e44", "#e8930c", "#5b6472"]
+
+
+def _knowledge_stats(questions) -> list:
+    """统计试卷知识点分布 [(知识点, 出现次数)]，按次数降序"""
+    c = Counter(
+        (str(q.get("knowledge_point") or "未标注").strip() or "未标注")
+        for q in (questions or [])
+    )
+    return c.most_common()
+
+
+def _tag_cloud_html(stats: list) -> str:
+    """知识点标签云：HTML 圆角胶囊，字号与颜色随出现次数变化"""
+    if not stats:
+        return ""
+    max_c = max(c for _, c in stats) or 1
+    spans = []
+    for i, (kp, cnt) in enumerate(stats):
+        size = 0.95 + 1.15 * (cnt / max_c)
+        color = _PALETTE[i % len(_PALETTE)]
+        spans.append(
+            f'<span style="display:inline-block;font-size:{size:.2f}rem;color:{color};'
+            f'font-weight:600;padding:0.2rem 0.55rem;margin:0.2rem 0.25rem;'
+            f'background:{color}1a;border-radius:999px;white-space:nowrap;">'
+            f'{_esc(kp)} <span style="opacity:0.65;font-size:0.78em;">×{cnt}</span></span>'
+        )
+    return f'<div style="line-height:2;">{"".join(spans)}</div>'
+
+
+def _radar_svg(labels: list, values: list) -> str:
+    """知识点覆盖率雷达图（SVG 多边形）：需 ≥3 个维度，值按最大项归一化"""
+    n = len(labels)
+    if n < 3:
+        return ""
+    cx, cy, R = 200, 200, 150
+    max_v = max(values) or 1
+
+    def pt(i, r):
+        ang = math.radians(-90 + i * 360.0 / n)
+        return (cx + r * math.cos(ang), cy + r * math.sin(ang))
+
+    rings = "".join(
+        f'<polygon points="{" ".join(f"{pt(i, R*frac)[0]:.1f},{pt(i, R*frac)[1]:.1f}" for i in range(n))}" '
+        f'fill="none" stroke="#e5e7eb" stroke-width="1"/>'
+        for frac in (0.25, 0.5, 0.75, 1.0)
+    )
+    axes = "".join(
+        f'<line x1="{cx}" y1="{cy}" x2="{pt(i, R)[0]:.1f}" y2="{pt(i, R)[1]:.1f}" '
+        f'stroke="#e5e7eb" stroke-width="1"/>'
+        for i in range(n)
+    )
+    poly_pts = " ".join(
+        f"{pt(i, R * values[i] / max_v)[0]:.1f},{pt(i, R * values[i] / max_v)[1]:.1f}"
+        for i in range(n)
+    )
+    dots = "".join(
+        f'<circle cx="{pt(i, R * values[i] / max_v)[0]:.1f}" cy="{pt(i, R * values[i] / max_v)[1]:.1f}" '
+        f'r="3" fill="#3b5bdb"/>'
+        for i in range(n)
+    )
+    label_txt = ""
+    for i, lab in enumerate(labels):
+        x, y = pt(i, R + 34)
+        anchor, tx = "middle", x
+        if x < cx - R * 0.6:
+            anchor, tx = "end", x - 6
+        elif x > cx + R * 0.6:
+            anchor, tx = "start", x + 6
+        label_txt += (
+            f'<text x="{tx:.1f}" y="{y:.1f}" text-anchor="{anchor}" font-size="12" fill="#333">'
+            f'{_esc(lab)}</text>'
+        )
+    return (
+        f'<svg viewBox="0 0 400 430" width="100%" style="max-width:430px;" '
+        f'xmlns="http://www.w3.org/2000/svg">{rings}{axes}'
+        f'<polygon points="{poly_pts}" fill="#3b5bdb33" stroke="#3b5bdb" stroke-width="2"/>'
+        f'{dots}{label_txt}</svg>'
+    )
+
+
+def _render_knowledge_vis(questions) -> None:
+    """试卷详情页知识点可视化：标签云 + 覆盖率雷达图"""
+    stats = _knowledge_stats(questions)
+    if not stats:
+        return
+    st.markdown('<div style="font-weight:600;margin:0.5rem 0 0.2rem 0;">🏷 知识点分布</div>',
+                unsafe_allow_html=True)
+    c1, c2 = st.columns([1.15, 1])
+    with c1:
+        st.caption("标签云（字号 = 出现次数）")
+        st.markdown(_tag_cloud_html(stats), unsafe_allow_html=True)
+    with c2:
+        labels = [kp for kp, _ in stats[:6]]
+        values = [c for _, c in stats[:6]]
+        if len(stats) > 6:
+            labels.append("其他")
+            values.append(sum(c for _, c in stats[6:]))
+        radar = _radar_svg(labels, values)
+        st.caption("覆盖率雷达图（各知识点题量分布）")
+        if radar:
+            st.markdown(radar, unsafe_allow_html=True)
+        else:
+            st.info("知识点≥3 个时展示雷达图")
+
+
+# ============================================================
+# 试卷编辑（单题重出 / 增删改）
+# ============================================================
+
+def _save_paper(paper_id: int, questions: list) -> None:
+    """复用现有 ExamPaperUpdate 接口：整卷题目 + 参考答案实时落库"""
+    payload = {
+        "questions": questions,
+        "reference_answers": [
+            {"qid": q.get("qid"), "answer": q.get("answer"),
+             "knowledge_point": q.get("knowledge_point")}
+            for q in questions
+        ],
+    }
+    api.put(f"/api/v1/exam/papers/{paper_id}", json=payload)
+
+
+def _render_editor(paper_id: int, detail: dict) -> None:
+    """试卷编辑模式：每道题支持单题重出 / 编辑 / 删除，底部可新增自定义试题"""
+    questions = detail.get("questions") or []
+    st.markdown("---")
+    st.markdown('<div style="font-weight:600;color:#3b5bdb;">✏️ 编辑模式</div>', unsafe_allow_html=True)
+    st.caption("单题重出 / 编辑 / 删除 / 新增均实时写入数据库，并自动刷新上方知识点标签云与雷达图。")
+
+    for q in questions:
+        qid = q.get("qid")
+        row = st.columns([3, 1, 1, 1])
+        with row[0]:
+            st.markdown(f"**第{qid}题** · {_TYPE_LABEL.get(q.get('type'), q.get('type'))}"
+                        f" · {q.get('score', 0)} 分")
+        with row[1]:
+            b_reg = st.button("🔁 重出", key=f"reg_{paper_id}_{qid}", use_container_width=True)
+        with row[2]:
+            b_edit = st.button("✏️ 编辑", key=f"edit_{paper_id}_{qid}", use_container_width=True)
+        with row[3]:
+            b_del = st.button("🗑 删除", key=f"del_{paper_id}_{qid}", use_container_width=True)
+
+        if b_reg:
+            with st.spinner(f"命题 Agent 正在重出第 {qid} 题…"):
+                try:
+                    detail2 = api.post(f"/api/v1/exam/papers/{paper_id}/regenerate/{qid}")
+                    if detail2.get("warning"):
+                        notify_error(detail2["warning"])
+                    else:
+                        notify_success(f"第 {qid} 题已重出")
+                except ApiError as e:
+                    notify_error(e.message)
+            st.rerun()
+        if b_del:
+            new_q = [x for x in questions if x.get("qid") != qid]
+            try:
+                _save_paper(paper_id, new_q)
+                notify_success("题目已删除")
+            except ApiError as e:
+                notify_error(e.message)
+            st.rerun()
+        if b_edit:
+            st.session_state[f"exam_editing_{paper_id}_{qid}"] = True
+
+        # 编辑表单
+        if st.session_state.get(f"exam_editing_{paper_id}_{qid}"):
+            with st.form(f"edit_form_{paper_id}_{qid}", border=True):
+                stem = st.text_area("题干", value=q.get("stem", ""), key=f"es_{paper_id}_{qid}")
+                if q.get("type") == "choice":
+                    opts = (q.get("options") or []) + [""] * (4 - len(q.get("options") or []))
+                    ca, cb = st.columns(2)
+                    cc, cd = st.columns(2)
+                    opt_a = ca.text_input("选项 A", value=opts[0], key=f"eo1_{paper_id}_{qid}")
+                    opt_b = cb.text_input("选项 B", value=opts[1], key=f"eo2_{paper_id}_{qid}")
+                    opt_c = cc.text_input("选项 C", value=opts[2], key=f"eo3_{paper_id}_{qid}")
+                    opt_d = cd.text_input("选项 D", value=opts[3], key=f"eo4_{paper_id}_{qid}")
+                else:
+                    opt_a = opt_b = opt_c = opt_d = ""
+                answer = st.text_input("参考答案", value=q.get("answer", ""), key=f"ea_{paper_id}_{qid}")
+                kp = st.text_input("知识点", value=q.get("knowledge_point", ""), key=f"ek_{paper_id}_{qid}")
+                score = st.number_input("分值", 1, 100, int(q.get("score") or 5), key=f"esc_{paper_id}_{qid}")
+                fc = st.columns([1, 1, 6])
+                saved = fc[0].form_submit_button("保存")
+                cancelled = fc[1].form_submit_button("取消")
+                if cancelled:
+                    st.session_state.pop(f"exam_editing_{paper_id}_{qid}", None)
+                    st.rerun()
+                if saved:
+                    updated = dict(q)
+                    updated["stem"] = stem.strip()
+                    updated["answer"] = answer.strip()
+                    updated["knowledge_point"] = kp.strip()
+                    updated["score"] = int(score)
+                    if q.get("type") == "choice":
+                        updated["options"] = [o for o in (opt_a, opt_b, opt_c, opt_d) if o.strip()]
+                    new_q = [updated if x.get("qid") == qid else x for x in questions]
+                    try:
+                        _save_paper(paper_id, new_q)
+                        notify_success("题目已更新")
+                    except ApiError as e:
+                        notify_error(e.message)
+                    st.session_state.pop(f"exam_editing_{paper_id}_{qid}", None)
+                    st.rerun()
+
+    # 新增自定义试题
+    with st.expander("➕ 新增自定义试题", expanded=False):
+        with st.form(f"add_form_{paper_id}"):
+            qtype = st.selectbox(
+                "题型", ["choice", "fill", "short"],
+                format_func=lambda t: _TYPE_LABEL.get(t, t), key=f"at_{paper_id}",
+            )
+            stem = st.text_area("题干", key=f"ast_{paper_id}")
+            if qtype == "choice":
+                ca, cb = st.columns(2)
+                cc, cd = st.columns(2)
+                opt_a = ca.text_input("选项 A", key=f"ao1_{paper_id}")
+                opt_b = cb.text_input("选项 B", key=f"ao2_{paper_id}")
+                opt_c = cc.text_input("选项 C", key=f"ao3_{paper_id}")
+                opt_d = cd.text_input("选项 D", key=f"ao4_{paper_id}")
+            else:
+                opt_a = opt_b = opt_c = opt_d = ""
+            answer = st.text_input("参考答案", key=f"aans_{paper_id}")
+            kp = st.text_input("知识点", key=f"akp_{paper_id}")
+            score = st.number_input("分值", 1, 100, 5, key=f"asc_{paper_id}")
+            add_clicked = st.form_submit_button("添加题目", type="primary")
+        if add_clicked:
+            new_q = {"type": qtype, "stem": stem.strip(), "answer": answer.strip(),
+                     "knowledge_point": kp.strip(), "score": int(score), "source_refs": []}
+            if qtype == "choice":
+                new_q["options"] = [o for o in (opt_a, opt_b, opt_c, opt_d) if o.strip()]
+            if not new_q["stem"]:
+                notify_error("题干不能为空")
+            elif qtype == "choice" and len(new_q.get("options", [])) < 2:
+                notify_error("选择题至少需要两个选项")
+            else:
+                try:
+                    _save_paper(paper_id, questions + [new_q])
+                    notify_success("题目已添加")
+                except ApiError as e:
+                    notify_error(e.message)
+                st.rerun()
 
 
 def _generate_block() -> None:
@@ -202,6 +454,13 @@ def _paper_history() -> None:
         empty_state("📝", "暂无试卷，生成后将在此展示")
         return
 
+    # 课程库角色映射（决定是否展示编辑入口：owner/admin 可编辑）
+    role_map = {}
+    try:
+        role_map = {kb["id"]: kb.get("user_role") for kb in api.get("/api/v1/kb", params={"page_size": 100})["items"]}
+    except ApiError:
+        pass
+
     st.markdown('<div style="font-weight:600;margin:0.6rem 0 0.4rem 0;">历史试卷</div>', unsafe_allow_html=True)
     for p in papers:
         status = p.get("status")
@@ -228,14 +487,22 @@ def _paper_history() -> None:
             except ApiError as e:
                 st.warning(e.message)
 
-            # 详情（题目 + 轨迹）
+            # 详情（知识点可视化 + 题目 + 轨迹）
             try:
                 detail = api.get(f"/api/v1/exam/papers/{p['id']}")
             except ApiError:
                 detail = None
             if detail:
+                _render_knowledge_vis(detail.get("questions"))
                 _render_questions(detail)
                 _render_trace(detail.get("trace"))
+
+                # 编辑模式（owner/admin，且试卷就绪）
+                can_edit = (role_map.get(p.get("knowledge_base_id")) in ("owner", "admin"))
+                if can_edit and status == "ready":
+                    edit_on = st.toggle("✏️ 编辑模式", key=f"edit_mode_{p['id']}")
+                    if edit_on:
+                        _render_editor(p["id"], detail)
 
 
 _SHEET_STATUS_LABEL = {"submitted": "待批改", "grading": "批改中", "graded": "已批改", "failed": "批改失败"}
@@ -275,6 +542,51 @@ def _render_grading_detail(sheet: dict) -> None:
             + '</div>',
             unsafe_allow_html=True,
         )
+
+        # 主观题：四维度分项打分（得分 / 点评 / 各维度溯源）
+        dims = d.get("dimensions") or []
+        if dims:
+            st.markdown('<div style="font-size:0.84rem;color:#3b5bdb;font-weight:600;margin-top:0.3rem;">'
+                        '📐 四维度分项打分</div>', unsafe_allow_html=True)
+            for dim in dims:
+                label = dim.get("label") or dim.get("key")
+                ds = dim.get("score", 0)
+                dm = dim.get("max_score", 0)
+                st.markdown(
+                    f'<div style="font-size:0.82rem;margin:0.2rem 0 0 0.5rem;">'
+                    f'<b>{_esc(label)}</b>：{ds}/{dm} 分</div>',
+                    unsafe_allow_html=True,
+                )
+                if dim.get("comment"):
+                    st.markdown(
+                        f'<div style="font-size:0.8rem;color:#444;margin-left:1rem;">{_esc(dim["comment"])}</div>',
+                        unsafe_allow_html=True,
+                    )
+                for r in (dim.get("source_refs") or [])[:2]:
+                    st.markdown(
+                        f'<div style="font-size:0.76rem;color:#7c3aed;margin-left:1rem;">📖 {_esc(r)}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+        # 客观题答错：错误解析 + 考察知识点（溯源片段见下方「课件原文溯源」）
+        if d.get("analysis"):
+            st.markdown(
+                f'<div style="font-size:0.84rem;color:#e03131;margin-top:0.3rem;">'
+                f'❌ 错误解析：{_esc(d["analysis"])}</div>',
+                unsafe_allow_html=True,
+            )
+        if d.get("knowledge_point") and d.get("objective_explain"):
+            st.markdown(
+                f'<div style="font-size:0.8rem;color:#555a63;margin-top:0.15rem;">'
+                f'🎯 本题考察知识点：{_esc(d["knowledge_point"])}</div>',
+                unsafe_allow_html=True,
+            )
+        if d.get("analysis_error"):
+            st.markdown(
+                f'<div style="font-size:0.8rem;color:#e8930c;">⚠️ 错误解析生成失败：{_esc(d["analysis_error"])}</div>',
+                unsafe_allow_html=True,
+            )
+
         strengths = d.get("strengths") or []
         missing = d.get("missing") or []
         refs = d.get("source_refs") or []

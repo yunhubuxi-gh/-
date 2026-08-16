@@ -67,10 +67,23 @@ def _upload_block(kb_id: int) -> None:
                         time.sleep(config.POLL_INTERVAL_SECONDS)
                         continue
                     s = doc.get("status")
-                    status_bar.progress(
-                        min(status_map.get(s, 0.1), 0.95),
-                        text=f"状态：{status_label.get(s, s)}",
-                    )
+                    pd = doc.get("progress_detail")
+                    # 细粒度 OCR 进度：{"stage":"ocr","done":x,"total":n}，展示「OCR识别中 x/总数」
+                    if isinstance(pd, dict) and pd.get("stage") == "ocr":
+                        done = int(pd.get("done") or 0)
+                        total = int(pd.get("total") or 0)
+                        frac = (done / total) if total else 0
+                        # parsing 阶段区间 0.15~0.30，OCR 占比内部细分
+                        inner_progress = 0.15 + 0.15 * min(max(frac, 0.0), 1.0)
+                        status_bar.progress(
+                            min(inner_progress, 0.95),
+                            text=f"OCR文字识别中：{done} / {total} 张",
+                        )
+                    else:
+                        status_bar.progress(
+                            min(status_map.get(s, 0.1), 0.95),
+                            text=f"状态：{status_label.get(s, s)}",
+                        )
                     if s in ("ready", "failed"):
                         if s == "ready":
                             status_bar.progress(1.0, text="写入向量库完成 ✅")

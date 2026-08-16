@@ -156,6 +156,21 @@ class DocumentCRUD:
         db.refresh(doc)
         return doc
 
+    def update_progress(
+        self,
+        db: Session,
+        doc_id: int,
+        progress_detail: Optional[dict] = None,
+    ) -> Optional[Document]:
+        """更新文档细粒度子阶段进度（progress_detail JSON，如 {stage:'ocr', done:23, total:56}）"""
+        doc = self.get_by_id(db, doc_id)
+        if not doc:
+            return None
+        doc.progress_detail = progress_detail
+        db.commit()
+        db.refresh(doc)
+        return doc
+
     def update_title(self, db: Session, doc_id: int, title: str) -> Optional[Document]:
         """更新文档标题"""
         doc = self.get_by_id(db, doc_id)

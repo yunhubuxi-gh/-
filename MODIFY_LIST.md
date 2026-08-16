@@ -691,3 +691,146 @@ docx 上传 → 解析正文 + 提取全部内嵌图片二进制（docx_parser.p
 - 明确密钥安全提示：`.env` 不入库，仓库仅保留 `.env.example` 占位模板。
 - 补充 docx/PDF 内嵌习题图片解析、强容错上传流水线、双可插拔多模态后端、RBAC 权限、LangGraph 双 Agent 等真实特性说明。
 - 新增「未来优化方向」，将「多模态后端运行时热切换」列为待实现项。
+
+---
+
+# 修改清单 — 三大痛点工程优化（性能 / 进度 / 内存 / OCR 健壮性）
+
+> 日期：2026-08-16
+> 范围：仅做性能与健壮性增强，原有全部业务逻辑（PDF/docx 解析、分片、双后端多模态、命题批改、RBAC、异步任务）完整保留，未改业务流程。
+
+## 一、OCR 多进程并发（提升大批量图片处理速度）
+
+> 关键发现：PaddleOCR 底层是 C++ 预测器（PaddleX），**非线程安全**——单进程内多线程并发调用
+> 同一实例 `predict()` 会触发 `invalid vector<bool> subscript` 并**段错误**（实测后端崩溃）。
+> 因此放弃 ThreadPoolExecutor 多线程，改为**多进程并发**（每个子进程独立 PaddleOCR 实例，进程间隔离）。
+
+- `utils/ocr_pool.py`（新增）：常驻 `ProcessPoolExecutor` 进程池，惰性创建、跨多次上传复用（避免每次重新加载模型）；每个 worker 子进程通过 initializer 独立加载 PaddleOCR；单张失败仅返回空串；进程池创建失败 / 执行异常 → **自动降级串行 OCR**（不崩溃）。
+- 进程数钳制：`min(settings.ocr_concurrency, 4, 图片数)`，默认 4，硬上限 4（进程比线程更耗内存，避免内存爆炸）。
+- `ai/rag_engine/document_parser/docx_parser.py`：`_scan_to_pages_and_images` 重构为「先收集全部内容单元 → 图片进程池并发 OCR → 按文档顺序组装逻辑页」，分页/分块语义与串行版**完全一致**；`_ocr_images_concurrent` 委托 `utils.ocr_pool.ocr_images_concurrent`。
+- `utils/ocr_engine.py`：`PaddleOCREngine` 增加 `_predict_lock` 串行化 `predict()`（防御性：串行降级路径与任何并发调用都不会段错误）。
+
+## 二、documents 表新增 progress_detail + 前端 OCR 细粒度进度
+
+- `db/models.py`：`Document` 新增 `progress_detail`（JSON）字段。
+- `db/crud/document_crud.py`：新增 `update_progress`。
+- `scripts/migrate_course.py`：新增 `add_document_progress_column`（幂等，SQLite=TEXT / PG=JSON）。
+- `services/document_service.py`：`_process_document` 各阶段上报 `progress_detail`；OCR 阶段由 `_report_ocr_progress` 自开独立 session 写入 `{stage:'ocr', done, total}`（进度回调在主进程触发，避免跨进程/线程 session 竞争）。
+- `ai/rag_engine/document_parser/parser_factory.py`：`parse_document` 增加可选 `progress_callback`（仅 DocxParser 使用，PDF/MD/TXT/图片忽略）。
+- `frontend/pages/document_page.py`：轮询读取 `progress_detail`，`stage=='ocr'` 时展示 `OCR文字识别中：done / total 张`。
+
+## 三、本地 Chinese-CLIP 内存回收（缓解 OOM）
+
+- `utils/multimodal_embedding_client.py`：`embed_images` / `embed_texts` 增加 `try/finally` 释放——`del` 中间 tensor、关闭 PIL 图像对象、`gc.collect()`；图片读取改用 `with Image.open()` 及时关闭文件句柄。
+- 新增 `_release_memory`：每次推理 `gc.collect()`，每 `clip_gc_interval`（默认 10）张做一次完整回收（含 `torch.cuda.empty_cache()`）。
+- 模型加载逻辑维持懒加载不变，**未做 ONNX 量化**（写入 README 未来优化方向）。
+
+## 四、修复 OCR 初始化失败永久僵死（指数退避重试 + 前端告警）
+
+- `utils/ocr_engine.py`：删除 `_init_failed` 一次性禁用逻辑；改为 `_init_fail_count` / `_init_failed_at` / `_init_fail_reason` 三态 + 指数退避（`ocr_retry_interval` 基础 60s，`base * 2^(n-1)`，封顶 960s）。
+- 退避期内直接返回 None（不反复初始化刷日志）；到期自动重试，临时故障恢复后**无需重启服务**即可重新使用 OCR。
+- 新增 `get_ocr_failure_reason()`；`document_service._ocr_failure_reason` 将失败原因写入前端任务警告（而非静默跳过）。
+
+## 五、配置新增（.env 可覆盖，带注释）
+
+| 配置 | 默认 | 说明 |
+|------|------|------|
+| `OCR_CONCURRENCY` | 4 | docx 大量图片并发 OCR 进程数（进程池，最终钳制 1~4） |
+| `OCR_RETRY_INTERVAL` | 60 | OCR 初始化失败后指数退避基础间隔（秒） |
+| `CLIP_GC_INTERVAL` | 10 | 本地 CLIP 每处理 N 张图做一次完整内存回收 |
+
+## 六、变更清单
+
+| 文件 | 变更 | 类型 |
+|------|------|------|
+| `utils/ocr_pool.py` | 新增：常驻进程池并发 OCR（含串行降级） | 新增 |
+| `utils/ocr_engine.py` | predict 加锁串行 + 指数退避重试 + 失败原因记录 | 修改 |
+| `ai/rag_engine/document_parser/docx_parser.py` | 图片 OCR 进程池并发化 + 进度回调 | 修改 |
+| `ai/rag_engine/document_parser/parser_factory.py` | `parse_document` 增加 progress_callback | 修改 |
+| `db/models.py` | Document 新增 progress_detail 字段 | 修改 |
+| `db/crud/document_crud.py` | 新增 update_progress | 修改 |
+| `scripts/migrate_course.py` | 新增 progress_detail 列迁移 | 修改 |
+| `services/document_service.py` | 细粒度进度上报 + OCR 失败告警 | 修改 |
+| `frontend/pages/document_page.py` | 前端展示 OCR 进度 x/总数 | 修改 |
+| `utils/multimodal_embedding_client.py` | 本地 CLIP 内存回收（del/gc/分批） | 修改 |
+| `config/settings.py` | 新增 ocr_concurrency / ocr_retry_interval / clip_gc_interval | 修改 |
+| `.env.example` | 新增 3 项配置（带注释） | 修改 |
+
+---
+
+# 上层业务迭代：题目去重与知识点均衡 · 试卷编辑 · 精细化溯源批改
+
+> 日期：2026-08-16
+> 范围：在现有稳定底模（多模态 RAG / 文档解析 / 双 Agent 出卷 / 批改 Agent / RBAC / 异步任务）之上，**只新增上层试卷业务逻辑**。
+> 硬性约束遵守：底层 RAG、文档解析、多模态双后端、异步任务、鉴权、数据库旧字段、原有接口入参出参**全部保留未动**；不重构双 Agent 链路、不新建大模型调用链路（去重/均衡为纯规则，单题重出复用双 Agent 图，批改升级复用批改 Agent）。
+> 数据库**未新增任何字段**（标签云/雷达图由 questions 实时计算，批改明细写入已有 grading_details JSON 列）。
+
+## 一、校验 Agent 新增第 5 组校验：题目相似度去重 + 知识点均衡检测
+
+- `ai/agent_langgraph/exam/validator_node.py`：
+  - 新增纯 Python「文本向量相似度」：字符 2-gram 计数向量余弦（`_char_ngrams` / `_vector_cosine` / `_text_similarity`），**零外部依赖**（不引入 sklearn，兼容全新环境）。
+  - 新增 `_cross_question_checks(questions, dup_threshold, max_ratio)` 跨题校验：
+    - **5.1 题目相似度去重**：两两对比「题干+知识点」相似度，≥ `EXAM_DUP_SIMILARITY_THRESHOLD` 判重复，保留先出现题、判后出现题 fail，回传命题 Agent 重出。
+    - **5.2 知识点均衡检测**：统计每题 knowledge_point（生成时已基于 RAG 课件原文、并经 4 项校验验证存在），单一知识点占比 > `EXAM_KNOWLEDGE_MAX_RATIO` 判定偏科，把超出上限的题判 fail 换考点重出。
+  - 在 `validator_node` 逐题 4 项校验之后追加执行；判定结果写入 `validation_results`（带 `rule: dedup/balance` 供前端轨迹展示）+ `rejected_questions`（带 reject_reason 回传命题 Agent）。
+  - **不改图拓扑**：仍为 generator → validator → 条件边重生成，仅在同一校验节点内追加跨题检查。
+
+## 二、试卷页面新增知识点标签云 + 覆盖率雷达图
+
+- `frontend/pages/exam_page.py`：`_render_knowledge_vis` / `_knowledge_stats` / `_tag_cloud_html` / `_radar_svg`。
+  - **标签云**：HTML 圆角胶囊，字号/颜色随知识点出现次数变化。
+  - **覆盖率雷达图**：纯 SVG 多边形（top6 知识点 + 其他），展示整套试卷考点分布均衡情况。
+  - 数据来自试卷 `questions[].knowledge_point`，前端实时计算，**无需后端改动、无新依赖**（无 plotly/matplotlib/wordcloud）。
+
+## 三、试卷编辑模式：单题重出、增删改试题
+
+- `ai/agent_langgraph/exam/exam_manager.py`：新增 `regenerate_question(kb_id, question, difficulty)` —— 以该题为「不合格题」喂入**现有双 Agent 图**（命题 Agent 换考点重出 → 校验 Agent 自动复核，max_iterate=1），复用原有节点，不新建 LLM 链路。
+- `services/exam_service.py`：
+  - 新增 `regenerate_question(db, user_id, paper_id, qid)`（admin+），重出结果实时落库并审计。
+  - 增强 `update`：提交 questions 时自动 `_sanitize_questions`（过滤无效题、重排 qid、校验选择题选项），并**自动重算 reference_answers / total_score / question_config**——编辑后标签云、雷达图数据自动一致。
+  - 新增 `_sanitize_questions` 静态方法。
+- `db/schemas.py`：`ExamPaperUpdate` 增加 `total_score` / `question_config` 可选字段（服务端重算覆盖）。
+- `api/router/exam_router.py`：新增 `POST /papers/{paper_id}/regenerate/{qid}`。
+- `frontend/pages/exam_page.py`：`_render_editor` / `_save_paper`——编辑模式开关（owner/admin 可见，read 学生隐藏），每题操作：**单题重出 / 编辑（题干/选项/答案/知识点/分值）/ 删除**，底部**新增自定义试题**；所有操作走现有 `PUT /papers/{id}`（ExamPaperUpdate）或重出端点，实时写入数据库，`st.rerun()` 后标签云/雷达图自动刷新。
+
+## 四、客观题错误解析 + 溯源
+
+- `ai/agent_langgraph/exam/grader.py`：新增 `grade_objective_detail(kb_id, question, student_answer, score)` —— 仅对**答错**的客观题（单选/填空）调用批改 Agent 生成「错误解析」：说明为什么错、本题考察知识点、课件溯源片段（题目自带 source_refs 优先，缺失则 RAG 检索；LLM 引用做逐字锚定防幻觉）。
+- `services/exam_service.py`：`submit_answer` 统一改走后台批改任务（全客观题试卷也异步），`_grade_task` 对答错客观题追加 `analysis` / `knowledge_point` / `source_refs` 写入 `grading_details`（复用已有 JSON 列，无新增字段）。
+- `frontend/pages/exam_page.py`：批改详情展示「❌ 错误解析 / 🎯 考察知识点 / 📖 课件原文溯源」。
+
+## 五、主观题四维度分项打分 + 分项溯源批改
+
+- `ai/agent_langgraph/exam/grader.py`：`grade_subjective` 升级为四维度分项：
+  - ① 知识点匹配度 ② 答题步骤完整性 ③ 结论答案正确性 ④ 语言表述规范性；
+  - 权重从 `.env` 读取并自动归一化（`_subjective_weights`，兼容 30/30/20/20 与 0.3/0.3/0.2/0.2）；满分按权重拆分（`_dimension_maxes`，余数按小数部分分配，保证各维满分之和=总分）。
+  - 每个维度独立 `score / max_score / comment / source_refs`（逐字锚定防幻觉）；返回结构新增 `dimensions`，同时保留 `score / strengths / missing / source_refs` 兼容旧消费方。
+- `services/exam_service.py`：`_grade_task` 将 `dimensions` 写入 `grading_details`。
+- `frontend/pages/exam_page.py`：批改详情展示「📐 四维度分项打分」——每维度得分、分项点评、各维度课件溯源原文。
+
+## 六、配置新增（.env 可覆盖，带注释）
+
+| 配置 | 默认 | 说明 |
+|------|------|------|
+| `EXAM_DUP_SIMILARITY_THRESHOLD` | 0.9 | 题目相似度去重阈值（文本向量相似度 0~1，达到即判重复并自动重出） |
+| `EXAM_KNOWLEDGE_MAX_RATIO` | 0.5 | 单一知识点题数占比上限，超过判定偏科并自动重出 |
+| `EXAM_GRADE_WEIGHT_KNOWLEDGE` | 0.3 | 主观题分项权重：知识点匹配度 |
+| `EXAM_GRADE_WEIGHT_STEPS` | 0.3 | 主观题分项权重：答题步骤完整性 |
+| `EXAM_GRADE_WEIGHT_CONCLUSION` | 0.2 | 主观题分项权重：结论答案正确性 |
+| `EXAM_GRADE_WEIGHT_LANGUAGE` | 0.2 | 主观题分项权重：语言表述规范性 |
+
+## 七、变更清单
+
+| 文件 | 变更 | 类型 |
+|------|------|------|
+| `ai/agent_langgraph/exam/validator_node.py` | 新增第 5 组校验（去重 + 知识点均衡，纯 Python 文本向量相似度） | 修改 |
+| `ai/agent_langgraph/exam/exam_manager.py` | 新增 `regenerate_question`（复用双 Agent 图） | 修改 |
+| `ai/agent_langgraph/exam/grader.py` | 主观题四维度分项打分 + 客观题错误解析 | 修改 |
+| `services/exam_service.py` | 单题重出 / 编辑自动重算 / 提交统一后台批改 / 客观题错误解析落库 | 修改 |
+| `db/schemas.py` | `ExamPaperUpdate` 增加 total_score / question_config | 修改 |
+| `api/router/exam_router.py` | 新增 `POST /papers/{id}/regenerate/{qid}` | 修改 |
+| `config/settings.py` | 新增 6 项配置（去重阈值/知识点占比/四维度权重） | 修改 |
+| `.env.example` | 新增 6 项配置（带注释） | 修改 |
+| `frontend/pages/exam_page.py` | 知识点标签云 + 雷达图 + 编辑模式 + 分项批改展示 | 修改 |
+
+> 数据库零新增字段；底层 RAG / 文档解析 / 多模态双后端 / 异步任务 / 鉴权 / 旧接口完全未动。

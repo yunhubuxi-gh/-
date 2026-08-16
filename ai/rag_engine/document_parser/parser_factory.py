@@ -55,19 +55,27 @@ def get_parser(file_path: str) -> BaseDocumentParser:
     return parser
 
 
-def parse_document(file_path: str) -> ParsedDocument:
+def parse_document(
+    file_path: str,
+    progress_callback=None,
+) -> ParsedDocument:
     """
     解析文档统一入口。
 
     Args:
         file_path: 磁盘文档路径（绝对路径）
+        progress_callback: 可选进度回调 `(done, total)`，仅 DocxParser 支持
+            （用于 docx 大量图片 OCR 的细粒度进度上报）。PDF/MD/TXT/图片解析器忽略该参数。
 
     Returns:
         ParsedDocument 统一结构
     """
     parser = get_parser(file_path)
     logger.info(f"开始解析文档: {file_path}")
-    parsed = parser.parse(file_path)
+    if isinstance(parser, DocxParser):
+        parsed = parser.parse(file_path, progress_callback=progress_callback)
+    else:
+        parsed = parser.parse(file_path)
     logger.info(
         f"解析完成: title={parsed.title}, pages={parsed.page_count}, "
         f"chars={parsed.char_count}"

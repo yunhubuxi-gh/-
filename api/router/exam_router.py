@@ -5,7 +5,8 @@
 - POST   /papers                    发起试卷生成（双 Agent 出卷，后台异步）
 - GET    /papers                    试卷列表（可指定课程库）
 - GET    /papers/{paper_id}         试卷详情（含题目 + 参考答案 + 双 Agent 轨迹）
-- PUT    /papers/{paper_id}         复用旧试卷修改（admin+）
+- PUT    /papers/{paper_id}         复用旧试卷修改 / 试卷编辑增删改（admin+）
+- POST   /papers/{paper_id}/regenerate/{qid}  试卷编辑「单题重出」（复用双 Agent 图，admin+）
 - DELETE /papers/{paper_id}         删除试卷（owner）
 - GET    /papers/{paper_id}/export  导出 Markdown（题目与参考答案可分开）
 - POST   /papers/{paper_id}/submit  学生提交答卷（客观题规则判分 + 主观题后台批改）
@@ -71,6 +72,19 @@ def update_paper(
     db: Session = Depends(get_db),
 ):
     return success_response(exam_service.update(db, user.id, paper_id, data), "试卷更新成功")
+
+
+@router.post("/papers/{paper_id}/regenerate/{qid}")
+def regenerate_question(
+    paper_id: int,
+    qid: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """试卷编辑「单题重出」：仅针对该题调用命题 Agent 重出一题（复用双 Agent 图），实时落库"""
+    return success_response(
+        exam_service.regenerate_question(db, user.id, paper_id, qid), "该题已重新生成"
+    )
 
 
 @router.delete("/papers/{paper_id}")

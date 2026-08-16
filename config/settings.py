@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     clip_download_retry: int = Field(
         default=3, description="Chinese-CLIP 模型下载重试次数，全部失败则关闭图片向量化功能",
     )
+    clip_gc_interval: int = Field(
+        default=10,
+        description="本地 Chinese-CLIP 每处理 N 张图片做一次完整内存回收（gc + empty_cache），"
+                    "缓解 CPU 多图连续推理内存泄漏/OOM",
+    )
 
     # ---- 豆包云端多模态向量化（provider=doubao 时生效，进程外 API 调用）----
     doubao_api_key: str = Field(default="", description="火山方舟 API Key（ARK_API_KEY）")
@@ -161,6 +166,10 @@ class Settings(BaseSettings):
     @field_validator(
         "multimodal_embedding_timeout", "image_max_side", "doubao_timeout",
         "doubao_image_embed_dim", "doubao_max_retry", "doubao_image_max_side",
+        "ocr_concurrency", "ocr_retry_interval", "clip_gc_interval",
+        "exam_dup_similarity_threshold", "exam_knowledge_max_ratio",
+        "exam_grade_weight_knowledge", "exam_grade_weight_steps",
+        "exam_grade_weight_conclusion", "exam_grade_weight_language",
         mode="before",
     )
     @classmethod
@@ -255,6 +264,31 @@ class Settings(BaseSettings):
         default="medium", description="试卷默认难度 easy/medium/hard"
     )
 
+    # ========== 试卷题目去重 / 知识点均衡 / 分项批改权重（上层业务迭代新增）==========
+    # 题目相似度去重阈值：试卷内任意两道题的「题干+知识点」文本向量相似度达到该值则判定重复，
+    # 由校验 Agent 第 5 组校验判 fail，并调用命题 Agent 单独重出该题（取值 0~1，越大越宽松）。
+    exam_dup_similarity_threshold: float = Field(
+        default=0.9, description="题目相似度去重阈值（文本向量相似度 0~1，达到即判重复）"
+    )
+    # 知识点均衡上限：单个知识点题数 / 总题数 超过该比例判定偏科，自动重出该知识点下多余题目（0~1）。
+    exam_knowledge_max_ratio: float = Field(
+        default=0.5, description="单一知识点占比上限，超过判定偏科并自动重出（0~1）"
+    )
+    # 主观题四维度分项打分权重（可在 .env 配置；代码内自动归一化，
+    # 既支持 30/30/20/20 也支持 0.3/0.3/0.2/0.2 两种写法）。
+    exam_grade_weight_knowledge: float = Field(
+        default=0.3, description="主观题分项权重：知识点匹配度"
+    )
+    exam_grade_weight_steps: float = Field(
+        default=0.3, description="主观题分项权重：答题步骤完整性"
+    )
+    exam_grade_weight_conclusion: float = Field(
+        default=0.2, description="主观题分项权重：结论答案正确性"
+    )
+    exam_grade_weight_language: float = Field(
+        default=0.2, description="主观题分项权重：语言表述规范性"
+    )
+
     # ========== 异步任务配置 ==========
     async_task_engine: Literal["background", "celery"] = Field(
         default="background",
@@ -267,6 +301,16 @@ class Settings(BaseSettings):
     ocr_enabled: bool = Field(default=True)
     ocr_engine: Literal["paddleocr", "tesseract"] = Field(default="paddleocr")
     ocr_lang: str = Field(default="ch")
+    # docx 等大量内嵌图片并发 OCR 的进程数（进程池，每个子进程独立 PaddleOCR）。
+    # PaddleOCR 底层非线程安全，多线程并发会段错误，故用多进程；进程内存开销大，钳制到 1~4。
+    ocr_concurrency: int = Field(
+        default=4, description="OCR 并发进程数（docx 大量图片并发识别，最终钳制 1~4）"
+    )
+    # OCR 初始化失败后的指数退避基础间隔（秒）：第 1 次失败后 60s 允许重试，
+    # 之后按 2 倍递增封顶；临时故障恢复后无需重启服务即可重新使用 OCR。
+    ocr_retry_interval: float = Field(
+        default=60.0, description="OCR 初始化失败后指数退避基础间隔（秒）"
+    )
 
     # ========== 文件存储配置 ==========
     upload_dir: str = Field(default="./data/uploads")

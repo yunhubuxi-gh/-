@@ -161,20 +161,37 @@ class DocumentService:
             self._clear_image_vectors(kb_id, document_id)
 
             # 1. 解析文件（PDF 内扫描页 / 图片文件的 OCR 文字识别在解析器内部完成）
+            self._set_progress(db, document_id, {"stage": "parsing"})
             document_crud.update_status(db, document_id, DocumentStatus.PARSING.value)
-            parsed = self._parse(file_path)
+
+            # OCR 细粒度进度回调：在并发 OCR 工作线程触发，须自开独立 session，
+            # 避免与主线程共享 db session 产生线程安全问题。
+            def ocr_progress(done: int, total: int) -> None:
+                self._report_ocr_progress(document_id, done, total)
+
+            parsed = self._parse(file_path, progress_callback=ocr_progress)
             document_crud.update_stats(
                 db, document_id, page_count=parsed.page_count, char_count=parsed.char_count,
             )
+
+            # OCR 初始化失败告警（反馈到前端任务警告，而非静默跳过图片文字）
+            ocr_reason = self._ocr_failure_reason()
+            if ocr_reason:
+                warnings.append(
+                    f"OCR 文字识别不可用（{ocr_reason}），图片内文字已跳过；"
+                    f"请检查依赖，或等待自动重试恢复"
+                )
 
             # 2. 提取页面图片（PDF 内嵌图）→ 落盘原图；图片文件则复用其自身。
             #    仅开关开启时收集（轻量，不在此加载 CLIP）；图片向量化在确有图片时才懒加载 CLIP。
             image_items: List[Dict[str, Any]] = []
             if settings.enable_image_embed:
+                self._set_progress(db, document_id, {"stage": "extracting_images"})
                 document_crud.update_status(db, document_id, DocumentStatus.EXTRACTING_IMAGES.value)
                 image_items = self._collect_images(document_id, kb_id, file_path, parsed)
 
             # 3. 文本分块 & 文本向量化（原有文本 RAG 链路，完全不动）
+            self._set_progress(db, document_id, {"stage": "embedding"})
             document_crud.update_status(db, document_id, DocumentStatus.EMBEDDING.value)
             pipeline = self._get_pipeline()
             chunk_count = pipeline.ingest_document(
@@ -187,12 +204,14 @@ class DocumentService:
             image_count = 0
             if image_items:
                 if self._image_embed_enabled():
+                    self._set_progress(db, document_id, {"stage": "image_preprocess"})
                     document_crud.update_status(db, document_id, DocumentStatus.IMAGE_PREPROCESS.value)
                     embed_items, pre_warnings = self._preprocess_images(document_id, kb_id, image_items)
                     warnings.extend(pre_warnings)
 
                     # 5. 图片多模态 Embedding 向量化（写入独立集合），逐张 try-except
                     if embed_items:
+                        self._set_progress(db, document_id, {"stage": "image_embedding"})
                         document_crud.update_status(db, document_id, DocumentStatus.IMAGE_EMBEDDING.value)
                         image_count, embed_warnings = pipeline.ingest_images(
                             kb_id, document_id, file_name, embed_items,
@@ -205,6 +224,7 @@ class DocumentService:
             # 6. 完成（图片失败仅写警告，不置 FAILED）
             warning_text = self._format_warning(warnings)
             document_crud.update_stats(db, document_id, chunk_count=chunk_count)
+            self._set_progress(db, document_id, {"stage": "ready"})
             document_crud.update_status(
                 db, document_id, DocumentStatus.READY.value, warning=warning_text,
             )
@@ -366,10 +386,45 @@ class DocumentService:
         return f"部分图片向量化失败（共 {len(warnings)} 张），文本内容已正常入库。详情：{detail}"
 
     @staticmethod
-    def _parse(file_path: str):
+    def _set_progress(db, document_id: int, detail: Dict[str, Any]) -> None:
+        """写入细粒度子阶段进度（progress_detail JSON），失败静默不影响主流程"""
+        try:
+            document_crud.update_progress(db, document_id, detail)
+        except Exception as e:
+            logger.warning(f"写入文档子阶段进度失败（忽略）: doc={document_id}, err={e}")
+
+    @staticmethod
+    def _report_ocr_progress(document_id: int, done: int, total: int) -> None:
+        """OCR 细粒度进度上报（在并发工作线程调用，自开独立 session，线程安全）"""
+        try:
+            from db.session import SyncSessionLocal
+            s = SyncSessionLocal()
+            try:
+                document_crud.update_progress(
+                    s, document_id, {"stage": "ocr", "done": done, "total": total},
+                )
+            finally:
+                s.close()
+        except Exception as e:
+            logger.warning(f"上报 OCR 进度失败（忽略）: doc={document_id}, err={e}")
+
+    @staticmethod
+    def _ocr_failure_reason() -> Optional[str]:
+        """返回 OCR 初始化失败原因（无失败返回 None），供前端任务告警"""
+        try:
+            from utils.ocr_engine import get_ocr_failure_reason, get_ocr_engine
+            reason = get_ocr_failure_reason()
+            if reason and get_ocr_engine() is None:
+                return reason
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _parse(file_path: str, progress_callback=None):
         """解析文档（复用 rag_engine 统一入口，不重写解析逻辑）"""
         from ai.rag_engine.document_parser import parse_document
-        return parse_document(file_path)
+        return parse_document(file_path, progress_callback=progress_callback)
 
     # ============================================================
     # 查询
