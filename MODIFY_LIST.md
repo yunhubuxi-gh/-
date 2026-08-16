@@ -607,3 +607,87 @@ python -X utf8 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
 | 3 | 错误账号密码登录 | 友好错误提示弹出（用户名/密码错误） |
 | 4 | 登录后各功能页 | 课件上传、多模态向量化、命题生成试题等原有功能不受影响 |
 
+
+---
+
+# 修改清单 — 修复 docx（Word）文档处理流水线
+
+> 日期：2026-08-16
+> 范围：仅修复 `ai/rag_engine/document_parser/docx_parser.py` 一个文件；PDF 解析/分块/向量写入、多模态双后端、登录界面、试卷生成逻辑**完全未改动**。
+
+## 一、问题根因
+
+原 `docx_parser.py` 存在两处缺陷，导致「上传 docx 能提取图片、但正文与图片文本不分块、不入库」：
+
+1. **未设置 `ParsedDocument.images` 字段**：`parse()` 返回时只填了 `pages`（正文文本），`images` 走 dataclass 默认值空列表 → 上层 `document_service._collect_images` 拿不到图片 → 图片不落盘、不做多模态向量化。
+2. **未做图片 OCR**：图片内的文字（截图习题）从未被识别，更未参与文本分块。
+
+而 PDF 之所以正常，是因为 `PDFParser.parse()` 同时完成三件事：正文文本进 `pages`、扫描页 OCR 文本进 `pages`、内嵌图进 `images`。docx 缺少后两条。
+
+## 二、修复方案（完全对齐 PDF 三通道）
+
+重写 `DocxParser.parse()`，产出与 PDF 一致的结构：
+
+| 通道 | 实现 |
+|------|------|
+| 正文文本 | 按文档顺序遍历段落与表格，段落文本 + 表格行文本（`列1 | 列2 | ...`） |
+| 图片提取 | 解析 docx zip 包 + rels 关系：遍历 body 的 `w:p`（段落）与 `w:tbl`（表格），递归查找 `a:blip[@r:embed]`（现代 DrawingML）与 `v:imagedata[@o:id]`（老式 VML），通过关系 id 从 `doc.part.rels` 取图片二进制与扩展名；按 rId 去重，段落内 + 表格内图片**不遗漏** |
+| 图片 OCR | 每张图片调用 `PaddleOCR.recognize_image_bytes`，OCR 文本并入当前逻辑页文本，参与统一分块 |
+
+关键设计：图片 OCR 文本直接写入 `parsed.pages[].text`（与正文一起），因此 `RagPipeline.ingest_document` 分块时**正文 + 图片 OCR 文本走完全相同的分块器（`SemanticChunker` / `RecursiveChunker`）、相同分块参数**，无需改动任何分块/向量写入代码。
+
+## 三、流水线对齐（与 PDF 完全一致）
+
+```
+docx 上传 → 解析正文 + 提取全部内嵌图片二进制（docx_parser.parse）
+        → 文本分块（正文 + 每张图片 OCR 文本，统一 SemanticChunker）
+        → 图片落盘原图（document_service._collect_images → _save_image_bytes）
+        → 图片预处理（过滤极小图/缩放/转 RGB）
+        → 多模态图片向量化（local Chinese-CLIP / volcano 豆包，按当前 provider）
+        → 文本向量 + 图片向量写入向量库
+        → 异步任务完成，前端提示；部分图片失败仅告警
+```
+
+其中 `_collect_images`、`_preprocess_images`、`ingest_document`、`ingest_images` 均为既有通用逻辑，**未改动**，docx 与 PDF 复用同一条流水线。
+
+## 四、异常隔离（硬性要求）
+
+| 异常场景 | 处理 |
+|----------|------|
+| 单张图片二进制读取失败 / rels 关系缺失 | `_resolve_image` 捕获后跳过该图，记录 warning |
+| 单张图片 OCR 失败（损坏图 / OCR 不可用） | `_ocr_image` try-except，OCR 文本为空，图片仍进 `images` 走多模态向量化 |
+| 单张图片损坏（PIL 打不开） | 多模态预处理 `preprocess_image` 返回 `(False, msg)`，上层逐张 try-except 跳过 |
+| 单张图片云端 API 报错（volcano） | `image_retriever.index_images` 逐张 try-except，跳过该图 |
+
+**任一单张图片失败，绝不中断整个 docx 上传任务**：正文文本与其余图片照常分片入库，任务整体标记 `ready`，仅输出警告。
+
+## 五、`ENABLE_IMAGE_EMBED=false` 行为
+
+总开关关闭时，`document_service._process_document` 跳过 `_collect_images` / `_preprocess_images` / `ingest_images`，docx 只走「解析正文 → 文本分块 → 文本向量化」纯文本链路，图片处理全部跳过（本 parser 的图片提取虽仍执行但不会被落盘/向量化，OCR 在解析阶段仍会执行——与 PDF 扫描页 OCR 行为一致，不产生额外外部调用）。
+
+## 六、变更清单
+
+| 文件 | 变更内容 | 类型 |
+|------|---------|------|
+| `ai/rag_engine/document_parser/docx_parser.py` | 重写 `parse()`：新增图片提取（zip+rels）、图片 OCR 并入文本分块、`images` 字段填充、逻辑页顺序扫描 | 修改 |
+
+> 其余文件（PDF 解析、分块器、document_service、rag_pipeline、image_retriever、多模态客户端等）**零改动**。
+
+---
+
+# 修改清单 — 重写优化项目 README
+
+> 日期：2026-08-16
+
+## 变更内容
+
+| 文件 | 变更内容 | 类型 |
+|------|---------|------|
+| `README.md` | 在旧版基础上迭代重写：继承原项目简介/架构/业务流程/目录结构/部署/测试等合理内容，补齐「项目亮点、功能模块列表、截图占位区、完整 .env 示例、使用说明、注意事项、未来优化方向」；按实际实现修正多模态后端切换描述（改为 `.env` 配置 + 重启，删除「运行时切换/系统设置页」等未实现能力） | 修改 |
+
+## 关键修正说明
+
+- 如实描述多模态后端切换：`IMAGE_EMBED_PROVIDER`（local/doubao）与 `ENABLE_IMAGE_EMBED` 总开关均通过 `.env` 配置、启动时读取，**需重启后端生效**；不编写「前端无需重启切换」「系统设置页」等当前未实现的功能。
+- 明确密钥安全提示：`.env` 不入库，仓库仅保留 `.env.example` 占位模板。
+- 补充 docx/PDF 内嵌习题图片解析、强容错上传流水线、双可插拔多模态后端、RBAC 权限、LangGraph 双 Agent 等真实特性说明。
+- 新增「未来优化方向」，将「多模态后端运行时热切换」列为待实现项。
